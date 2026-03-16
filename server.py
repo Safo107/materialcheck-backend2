@@ -48,20 +48,6 @@ api_router = APIRouter(prefix="/api")
 # MODELS
 # -----------------------------
 
-class Folder(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    name: str
-    icon: str = "folder"
-    color: str = "#3B82F6"
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-
-
-class FolderCreate(BaseModel):
-    name: str
-    icon: str = "folder"
-    color: str = "#3B82F6"
-
-
 class Article(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     folder_id: str = ""
@@ -83,15 +69,6 @@ class ArticleCreate(BaseModel):
     category: str = ""
 
 
-class ArticleUpdate(BaseModel):
-    name: Optional[str] = None
-    folder_id: Optional[str] = None
-    current_stock: Optional[int] = None
-    min_stock: Optional[int] = None
-    unit: Optional[str] = None
-    category: Optional[str] = None
-
-
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
@@ -107,7 +84,15 @@ class ChatResponse(BaseModel):
 
 @api_router.get("/")
 async def root():
-    return {"message": "Material Check API - ElektroGenius"}
+    return {"message": "MaterialCheck API läuft"}
+
+# -----------------------------
+# HEALTH CHECK (für Render)
+# -----------------------------
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 # -----------------------------
 # ARTICLES
@@ -115,7 +100,7 @@ async def root():
 
 @api_router.get("/articles", response_model=List[Article])
 async def get_articles():
-    articles = await db.articles.find().to_list(1000)
+    articles = await db.articles.find().limit(50).to_list(50)
     return [Article(**a) for a in articles]
 
 
@@ -129,8 +114,10 @@ async def create_article(input: ArticleCreate):
 @api_router.delete("/articles/{article_id}")
 async def delete_article(article_id: str):
     result = await db.articles.delete_one({"id": article_id})
+
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Artikel nicht gefunden")
+
     return {"message": "Artikel gelöscht"}
 
 # -----------------------------
@@ -140,7 +127,7 @@ async def delete_article(article_id: str):
 @api_router.post("/chat", response_model=ChatResponse)
 async def chat_with_ai(request: ChatRequest):
 
-    articles = await db.articles.find().to_list(1000)
+    articles = await db.articles.find().limit(50).to_list(50)
     articles_list = [Article(**a) for a in articles]
 
     inventory_context = "Aktuelle Artikel im Inventar:\n"
@@ -161,7 +148,7 @@ Du kannst:
 Wenn du eine Aktion ausführen willst, antworte im JSON Format:
 
 {{
-"action": "add_article | adjust_stock | delete_article | shopping_list | none",
+"action": "add_article | adjust_stock | none",
 "data": {{}},
 "message": "Antwort an den Benutzer"
 }}
@@ -171,6 +158,8 @@ Wenn du eine Aktion ausführen willst, antworte im JSON Format:
 
         completion = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
+            max_tokens=200,
+            temperature=0.2,
             messages=[
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": request.message},
@@ -258,7 +247,7 @@ async def shutdown_db_client():
     client.close()
 
 # -----------------------------
-# RENDER START
+# START SERVER (Render)
 # -----------------------------
 
 if __name__ == "__main__":
