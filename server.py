@@ -13,18 +13,33 @@ import uuid
 from datetime import datetime
 import json
 import re
+import uvicorn
+
+# -----------------------------
+# ENV LOAD
+# -----------------------------
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-# MongoDB connection
+# -----------------------------
+# DATABASE
+# -----------------------------
+
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
 
-# OpenAI Client
+# -----------------------------
+# OPENAI
+# -----------------------------
+
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+# -----------------------------
+# FASTAPI
+# -----------------------------
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -75,17 +90,6 @@ class ArticleUpdate(BaseModel):
     min_stock: Optional[int] = None
     unit: Optional[str] = None
     category: Optional[str] = None
-
-
-class StockAdjust(BaseModel):
-    amount: int
-
-
-class ChatMessage(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    role: str
-    content: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
 class ChatRequest(BaseModel):
@@ -229,7 +233,6 @@ Wenn du eine Aktion ausführen willst, antworte im JSON Format:
     except Exception as e:
 
         logging.error(e)
-
         raise HTTPException(status_code=500, detail="KI Fehler")
 
 # -----------------------------
@@ -246,6 +249,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -----------------------------
+# SHUTDOWN
+# -----------------------------
+
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
+
+# -----------------------------
+# RENDER START
+# -----------------------------
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("server:app", host="0.0.0.0", port=port)
