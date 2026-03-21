@@ -78,6 +78,16 @@ class ChatResponse(BaseModel):
     response: str
     actions_taken: List[str] = []
 
+
+class ProfileModel(BaseModel):
+    deviceId: str
+    firmName: str = ""
+    userName: str = ""
+    email: str = ""
+    logoUri: Optional[str] = None
+    updatedAt: str = ""
+
+
 # -----------------------------
 # ROOT
 # -----------------------------
@@ -114,10 +124,8 @@ async def create_article(input: ArticleCreate):
 @api_router.delete("/articles/{article_id}")
 async def delete_article(article_id: str):
     result = await db.articles.delete_one({"id": article_id})
-
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Artikel nicht gefunden")
-
     return {"message": "Artikel gelöscht"}
 
 # -----------------------------
@@ -131,7 +139,6 @@ async def chat_with_ai(request: ChatRequest):
     articles_list = [Article(**a) for a in articles]
 
     inventory_context = "Aktuelle Artikel im Inventar:\n"
-
     for a in articles_list:
         inventory_context += f"- {a.name}: {a.current_stock} {a.unit}\n"
 
@@ -155,7 +162,6 @@ Wenn du eine Aktion ausführen willst, antworte im JSON Format:
 """
 
     try:
-
         completion = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
             max_tokens=200,
@@ -167,62 +173,82 @@ Wenn du eine Aktion ausführen willst, antworte im JSON Format:
         )
 
         response = completion.choices[0].message.content
-
         actions_taken = []
         final_response = response
 
         json_match = re.search(r"\{.*\}", response, re.DOTALL)
 
         if json_match:
-
             action_data = json.loads(json_match.group(0))
             action = action_data.get("action")
             data = action_data.get("data", {})
             message = action_data.get("message", response)
 
             if action == "add_article":
-
                 article = ArticleCreate(
                     name=data.get("name", "Neuer Artikel"),
                     current_stock=data.get("current_stock", 0),
                     min_stock=data.get("min_stock", 5),
                 )
-
                 new_article = Article(**article.model_dump())
                 await db.articles.insert_one(new_article.model_dump())
-
                 actions_taken.append(f"Artikel {article.name} hinzugefügt")
 
             if action == "adjust_stock":
-
                 article_name = data.get("article_name")
                 amount = data.get("amount", 0)
-
                 article = await db.articles.find_one(
                     {"name": {"$regex": f"^{re.escape(article_name)}$", "$options": "i"}}
                 )
-
                 if article:
-
                     new_stock = max(0, article["current_stock"] + amount)
-
                     await db.articles.update_one(
                         {"id": article["id"]},
                         {"$set": {"current_stock": new_stock}},
                     )
-
-                    actions_taken.append(
-                        f"Bestand von {article['name']} geändert ({amount})"
-                    )
+                    actions_taken.append(f"Bestand von {article['name']} geändert ({amount})")
 
             final_response = message
 
         return ChatResponse(response=final_response, actions_taken=actions_taken)
 
     except Exception as e:
-
         logging.error(e)
         raise HTTPException(status_code=500, detail="KI Fehler")
+
+# -----------------------------
+# PROFIL
+# -----------------------------
+
+@api_router.post("/profile")
+async def save_profile(profile: ProfileModel):
+    """Profil speichern oder aktualisieren"""
+    try:
+        await db.profiles.update_one(
+            {"deviceId": profile.deviceId},
+            {"$set": profile.model_dump()},
+            upsert=True
+        )
+        return {"success": True, "message": "Profil gespeichert"}
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Profil konnte nicht gespeichert werden")
+
+
+@api_router.get("/profile/{device_id}")
+async def get_profile(device_id: str):
+    """Profil laden"""
+    try:
+        profile = await db.profiles.find_one({"deviceId": device_id})
+        if not profile:
+            raise HTTPException(status_code=404, detail="Profil nicht gefunden")
+        profile.pop("_id", None)
+        return profile
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Profil konnte nicht geladen werden")
 
 # -----------------------------
 # ROUTER
