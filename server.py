@@ -96,6 +96,7 @@ class ProfileModel(BaseModel):
 async def root():
     return {"message": "MaterialCheck API läuft"}
 
+
 # -----------------------------
 # HEALTH CHECK (für Render)
 # -----------------------------
@@ -103,6 +104,7 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
 
 # -----------------------------
 # ARTICLES
@@ -127,6 +129,7 @@ async def delete_article(article_id: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Artikel nicht gefunden")
     return {"message": "Artikel gelöscht"}
+
 
 # -----------------------------
 # AI CHAT
@@ -216,6 +219,7 @@ Wenn du eine Aktion ausführen willst, antworte im JSON Format:
         logging.error(e)
         raise HTTPException(status_code=500, detail="KI Fehler")
 
+
 # -----------------------------
 # PROFIL
 # -----------------------------
@@ -235,6 +239,22 @@ async def save_profile(profile: ProfileModel):
         raise HTTPException(status_code=500, detail="Profil konnte nicht gespeichert werden")
 
 
+@api_router.get("/profile/by-email/{email}")
+async def get_profile_by_email(email: str):
+    """Profil anhand E-Mail laden"""
+    try:
+        profile = await db.profiles.find_one({"email": email})
+        if not profile:
+            raise HTTPException(status_code=404, detail="Kein Profil für diese E-Mail gefunden")
+        profile.pop("_id", None)
+        return profile
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler beim Laden")
+
+
 @api_router.get("/profile/{device_id}")
 async def get_profile(device_id: str):
     """Profil laden"""
@@ -249,6 +269,7 @@ async def get_profile(device_id: str):
     except Exception as e:
         logging.error(e)
         raise HTTPException(status_code=500, detail="Profil konnte nicht geladen werden")
+
 
 # -----------------------------
 # ROUTER
@@ -271,6 +292,7 @@ app.add_middleware(
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
+
 
 # -----------------------------
 # START SERVER (Render)
