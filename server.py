@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Query
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -9,8 +9,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 from datetime import datetime
-import re
-import uvicorn
+import re, uvicorn
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -18,8 +17,7 @@ load_dotenv(ROOT_DIR / ".env")
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+ai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -27,31 +25,29 @@ api_router = APIRouter(prefix="/api")
 # ─── WEBSOCKET MANAGER ────────────────────────────
 class ConnectionManager:
     def __init__(self):
-        # folder_id -> list of websockets
         self.active: Dict[str, List[WebSocket]] = {}
-        # websocket -> user info
         self.users: Dict[WebSocket, dict] = {}
 
-    async def connect(self, ws: WebSocket, folder_id: str, user_info: dict):
+    async def connect(self, ws: WebSocket, room: str, user_info: dict):
         await ws.accept()
-        if folder_id not in self.active:
-            self.active[folder_id] = []
-        self.active[folder_id].append(ws)
-        self.users[ws] = { **user_info, "folder_id": folder_id, "connectedAt": datetime.utcnow().isoformat() }
-        await self.broadcast_active_users(folder_id)
+        if room not in self.active:
+            self.active[room] = []
+        self.active[room].append(ws)
+        self.users[ws] = {**user_info, "room": room, "connectedAt": datetime.utcnow().isoformat()}
+        await self.broadcast_active_users(room)
 
     def disconnect(self, ws: WebSocket):
-        folder_id = self.users.get(ws, {}).get("folder_id")
-        if folder_id and folder_id in self.active:
-            self.active[folder_id] = [w for w in self.active[folder_id] if w != ws]
+        room = self.users.get(ws, {}).get("room")
+        if room and room in self.active:
+            self.active[room] = [w for w in self.active[room] if w != ws]
         self.users.pop(ws, None)
-        return folder_id
+        return room
 
-    async def broadcast_to_folder(self, folder_id: str, message: dict, exclude: WebSocket = None):
-        if folder_id not in self.active:
+    async def broadcast(self, room: str, message: dict, exclude: WebSocket = None):
+        if room not in self.active:
             return
         dead = []
-        for ws in self.active[folder_id]:
+        for ws in self.active[room]:
             if ws == exclude:
                 continue
             try:
@@ -61,11 +57,11 @@ class ConnectionManager:
         for ws in dead:
             self.disconnect(ws)
 
-    async def broadcast_active_users(self, folder_id: str):
-        if folder_id not in self.active:
+    async def broadcast_active_users(self, room: str):
+        if room not in self.active:
             return
-        users = [self.users[ws] for ws in self.active[folder_id] if ws in self.users]
-        await self.broadcast_to_folder(folder_id, { "type": "active_users", "users": users })
+        users = [self.users[ws] for ws in self.active[room] if ws in self.users]
+        await self.broadcast(room, {"type": "active_users", "users": users})
 
 manager = ConnectionManager()
 
@@ -79,10 +75,23 @@ class ProfileModel(BaseModel):
     logoUri: Optional[str] = None
     updatedAt: str = ""
     pin: Optional[str] = None
+    companyId: Optional[str] = None
+    companyRole: Optional[str] = None
 
 class ProfileLoadRequest(BaseModel):
     email: str
     pin: str
+    deviceId: str = ""
+
+class MaterialSyncModel(BaseModel):
+    deviceId: str
+    email: str
+    folders: list = []
+    materials: list = []
+    tasks: list = []
+    suppliers: list = []
+    loans: list = []
+    syncedAt: str = ""
 
 class CompanyCreateRequest(BaseModel):
     ownerEmail: str
@@ -94,9 +103,9 @@ class InviteRequest(BaseModel):
     companyId: str
     inviterEmail: str
     inviteeEmail: str
-    folderId: str
-    folderName: str
-    role: str = "member"  # "member" | "readonly"
+    warehouseId: str
+    warehouseName: str
+    role: str = "member"
 
 class AcceptInviteRequest(BaseModel):
     inviteId: str
@@ -107,25 +116,16 @@ class GrantRoleRequest(BaseModel):
     companyId: str
     ownerEmail: str
     targetEmail: str
-    folderId: str
-    newRole: str  # "member" | "readonly" | "admin"
+    warehouseId: str
+    newRole: str
 
-class FolderSyncRequest(BaseModel):
+class WarehouseSyncRequest(BaseModel):
     companyId: str
-    folderId: str
+    warehouseId: str
     userEmail: str
     materials: list = []
-    activities: list = []
-    syncedAt: str = ""
-
-class MaterialSyncModel(BaseModel):
-    deviceId: str
-    email: str
-    folders: list = []
-    materials: list = []
     tasks: list = []
-    suppliers: list = []
-    loans: list = []
+    activities: list = []
     syncedAt: str = ""
 
 class ChatRequest(BaseModel):
@@ -152,7 +152,7 @@ async def health():
 
 @api_router.get("/")
 async def root():
-    return {"message": "MaterialCheck API v2 — Team Edition"}
+    return {"message": "MaterialCheck API v3 — Warehouse Edition"}
 
 # ─── PROFIL ───────────────────────────────────────
 
@@ -163,7 +163,23 @@ async def save_profile(profile: ProfileModel):
         if data.get("pin"):
             data["pinHash"] = hash_pin(data["pin"])
         data.pop("pin", None)
-        await db.profiles.update_one({"deviceId": profile.deviceId}, {"$set": data}, upsert=True)
+        # Aktives Gerät tracken — nur 1 aktives Gerät pro Email
+        data["lastActiveAt"] = datetime.utcnow().isoformat()
+        await db.profiles.update_one(
+            {"deviceId": profile.deviceId},
+            {"$set": data},
+            upsert=True
+        )
+        # Andere Geräte mit gleicher Email als inaktiv markieren
+        if profile.email:
+            await db.profiles.update_many(
+                {"email": profile.email, "deviceId": {"$ne": profile.deviceId}},
+                {"$set": {"isActive": False}}
+            )
+            await db.profiles.update_one(
+                {"deviceId": profile.deviceId},
+                {"$set": {"isActive": True}}
+            )
         return {"success": True}
     except Exception as e:
         logging.error(e)
@@ -179,7 +195,22 @@ async def load_profile(request: ProfileLoadRequest):
             raise HTTPException(status_code=404, detail="Kein Profil gefunden")
         if hash_pin(request.pin) != profile.get("pinHash", ""):
             raise HTTPException(status_code=401, detail="Falscher PIN")
-        profile.pop("_id", None); profile.pop("pinHash", None); profile.pop("pin", None)
+        # Altes Gerät abmelden, neues aktivieren
+        if request.deviceId:
+            await db.profiles.update_many(
+                {"email": request.email},
+                {"$set": {"isActive": False}}
+            )
+            # Neues Gerät registrieren
+            new_profile = {**profile, "deviceId": request.deviceId, "isActive": True, "lastActiveAt": datetime.utcnow().isoformat()}
+            await db.profiles.update_one(
+                {"deviceId": request.deviceId},
+                {"$set": new_profile},
+                upsert=True
+            )
+        profile.pop("_id", None)
+        profile.pop("pinHash", None)
+        profile.pop("pin", None)
         return profile
     except HTTPException:
         raise
@@ -192,14 +223,22 @@ async def check_profile(email: str):
     profile = await db.profiles.find_one({"email": email})
     if not profile:
         raise HTTPException(status_code=404, detail="Nicht gefunden")
-    return {"exists": True, "hasPin": bool(profile.get("pinHash")), "firmName": profile.get("firmName",""), "userName": profile.get("userName","")}
+    return {
+        "exists": True,
+        "hasPin": bool(profile.get("pinHash")),
+        "firmName": profile.get("firmName", ""),
+        "userName": profile.get("userName", ""),
+        "companyId": profile.get("companyId", ""),
+        "companyRole": profile.get("companyRole", ""),
+    }
 
 @api_router.get("/profile/{device_id}")
 async def get_profile(device_id: str):
     profile = await db.profiles.find_one({"deviceId": device_id})
     if not profile:
         raise HTTPException(status_code=404, detail="Nicht gefunden")
-    profile.pop("_id", None); profile.pop("pinHash", None)
+    profile.pop("_id", None)
+    profile.pop("pinHash", None)
     return profile
 
 # ─── MATERIALIEN SYNC (Privat) ────────────────────
@@ -212,8 +251,7 @@ async def sync_materials(data: MaterialSyncModel):
         await db.material_syncs.update_one({"email": data.email}, {"$set": sync_data}, upsert=True)
         return {"success": True, "syncedAt": sync_data["syncedAt"]}
     except Exception as e:
-        logging.error(e)
-        raise HTTPException(status_code=500, detail="Sync Fehler")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.get("/materials/sync/{email}")
 async def get_synced_materials(email: str, pin: str):
@@ -233,25 +271,21 @@ async def get_synced_materials(email: str, pin: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Fehler")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ─── FIRMA ERSTELLEN ──────────────────────────────
+# ─── FIRMA ────────────────────────────────────────
 
 @api_router.post("/company/create")
 async def create_company(req: CompanyCreateRequest):
     try:
-        # Prüfen ob Nutzer existiert
         profile = await db.profiles.find_one({"email": req.ownerEmail})
         if not profile:
-            raise HTTPException(status_code=404, detail="Profil nicht gefunden — zuerst Profil erstellen")
-
-        # Firma erstellen
+            raise HTTPException(status_code=404, detail="Profil nicht gefunden — zuerst Profil in Cloud speichern")
         company_id = new_id()
         company = {
             "companyId": company_id,
             "companyName": req.companyName,
             "ownerEmail": req.ownerEmail,
-            "ownerName": req.ownerName,
             "createdAt": datetime.utcnow().isoformat(),
             "members": [{
                 "email": req.ownerEmail,
@@ -259,23 +293,20 @@ async def create_company(req: CompanyCreateRequest):
                 "role": "owner",
                 "joinedAt": datetime.utcnow().isoformat(),
                 "deviceId": req.deviceId,
-                "isActive": False,
+                "isActive": True,
             }],
-            "folders": [],
+            "warehouses": [],  # Geteilte Lager
         }
         await db.companies.insert_one(company)
-
-        # Profil updaten
-        await db.profiles.update_one({"email": req.ownerEmail}, {"$set": {"companyId": company_id, "companyRole": "owner"}})
-
+        await db.profiles.update_one(
+            {"email": req.ownerEmail},
+            {"$set": {"companyId": company_id, "companyRole": "owner"}}
+        )
         return {"success": True, "companyId": company_id, "companyName": req.companyName}
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(e)
         raise HTTPException(status_code=500, detail=str(e))
-
-# ─── FIRMA LADEN ──────────────────────────────────
 
 @api_router.get("/company/{company_id}")
 async def get_company(company_id: str, email: str):
@@ -284,28 +315,21 @@ async def get_company(company_id: str, email: str):
         if not company:
             raise HTTPException(status_code=404, detail="Firma nicht gefunden")
         company.pop("_id", None)
-
-        # Prüfen ob Nutzer Mitglied ist
         member = next((m for m in company.get("members", []) if m["email"] == email), None)
         if not member:
             raise HTTPException(status_code=403, detail="Kein Zugriff")
-
-        # Nur Ordner zurückgeben auf die der Nutzer Zugriff hat
-        user_role = member.get("role", "readonly")
+        user_role = member.get("role", "member")
         if user_role in ["owner", "admin"]:
-            # Chef/Admin sieht alle Ordner
-            accessible_folders = company.get("folders", [])
+            warehouses = company.get("warehouses", [])
         else:
-            # Mitarbeiter sieht nur eingeladene Ordner
-            accessible_folders = [f for f in company.get("folders", [])
-                                 if any(a["email"] == email for a in f.get("access", []))]
-
+            warehouses = [w for w in company.get("warehouses", [])
+                         if any(a["email"] == email for a in w.get("access", []))]
         return {
             "companyId": company["companyId"],
             "companyName": company["companyName"],
             "ownerEmail": company["ownerEmail"],
             "members": company.get("members", []),
-            "folders": accessible_folders,
+            "warehouses": warehouses,
             "userRole": user_role,
         }
     except HTTPException:
@@ -313,7 +337,7 @@ async def get_company(company_id: str, email: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── EINLADUNG SENDEN ─────────────────────────────
+# ─── EINLADUNGEN ──────────────────────────────────
 
 @api_router.post("/company/invite")
 async def invite_member(req: InviteRequest):
@@ -321,13 +345,13 @@ async def invite_member(req: InviteRequest):
         company = await db.companies.find_one({"companyId": req.companyId})
         if not company:
             raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-
-        # Nur Chef/Admin darf einladen
         inviter = next((m for m in company.get("members", []) if m["email"] == req.inviterEmail), None)
         if not inviter or inviter.get("role") not in ["owner", "admin"]:
             raise HTTPException(status_code=403, detail="Nur Chef oder Admin kann einladen")
-
-        # Einladung erstellen
+        # Prüfen ob Eingeladener ein Konto hat
+        invitee_profile = await db.profiles.find_one({"email": req.inviteeEmail})
+        if not invitee_profile:
+            raise HTTPException(status_code=404, detail=f"Kein Konto mit Email {req.inviteeEmail} gefunden")
         invite_id = new_id()
         invite = {
             "inviteId": invite_id,
@@ -336,8 +360,8 @@ async def invite_member(req: InviteRequest):
             "inviterEmail": req.inviterEmail,
             "inviterName": inviter.get("name", ""),
             "inviteeEmail": req.inviteeEmail,
-            "folderId": req.folderId,
-            "folderName": req.folderName,
+            "warehouseId": req.warehouseId,
+            "warehouseName": req.warehouseName,
             "role": req.role,
             "status": "pending",
             "createdAt": datetime.utcnow().isoformat(),
@@ -349,8 +373,6 @@ async def invite_member(req: InviteRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── EINLADUNGEN ABRUFEN ──────────────────────────
-
 @api_router.get("/company/invites/{email}")
 async def get_invites(email: str):
     try:
@@ -361,8 +383,6 @@ async def get_invites(email: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── EINLADUNG ANNEHMEN ───────────────────────────
-
 @api_router.post("/company/accept")
 async def accept_invite(req: AcceptInviteRequest):
     try:
@@ -372,61 +392,52 @@ async def accept_invite(req: AcceptInviteRequest):
         if invite["inviteeEmail"] != req.userEmail:
             raise HTTPException(status_code=403, detail="Nicht berechtigt")
         if invite["status"] != "pending":
-            raise HTTPException(status_code=400, detail="Einladung bereits bearbeitet")
-
+            raise HTTPException(status_code=400, detail="Bereits bearbeitet")
         company_id = invite["companyId"]
         company = await db.companies.find_one({"companyId": company_id})
-
-        # Nutzer als Mitglied hinzufügen falls noch nicht
         existing = next((m for m in company.get("members", []) if m["email"] == req.userEmail), None)
         if not existing:
             profile = await db.profiles.find_one({"email": req.userEmail})
             new_member = {
                 "email": req.userEmail,
-                "name": profile.get("userName","") if profile else req.userEmail,
+                "name": profile.get("userName", "") if profile else req.userEmail,
                 "role": invite["role"],
                 "joinedAt": datetime.utcnow().isoformat(),
                 "deviceId": req.deviceId,
-                "isActive": False,
+                "isActive": True,
             }
             await db.companies.update_one({"companyId": company_id}, {"$push": {"members": new_member}})
-
-        # Ordner Zugriff hinzufügen
-        folder_id = invite["folderId"]
-        folders = company.get("folders", [])
-        folder_exists = any(f["folderId"] == folder_id for f in folders)
-
-        if not folder_exists:
-            # Ordner in Firma erstellen
-            await db.companies.update_one({"companyId": company_id}, {"$push": {"folders": {
-                "folderId": folder_id,
-                "folderName": invite["folderName"],
+        warehouse_id = invite["warehouseId"]
+        warehouses = company.get("warehouses", [])
+        wh_exists = any(w["warehouseId"] == warehouse_id for w in warehouses)
+        if not wh_exists:
+            await db.companies.update_one({"companyId": company_id}, {"$push": {"warehouses": {
+                "warehouseId": warehouse_id,
+                "warehouseName": invite["warehouseName"],
+                "warehouseIcon": "🏗️",
                 "access": [{"email": req.userEmail, "role": invite["role"]}],
                 "materials": [],
+                "tasks": [],
                 "activities": [],
                 "lastSync": datetime.utcnow().isoformat(),
+                "lastSyncBy": req.userEmail,
             }}})
         else:
-            # Nutzer zu Ordner Zugriff hinzufügen
             await db.companies.update_one(
-                {"companyId": company_id, "folders.folderId": folder_id},
-                {"$push": {"folders.$.access": {"email": req.userEmail, "role": invite["role"]}}}
+                {"companyId": company_id, "warehouses.warehouseId": warehouse_id},
+                {"$push": {"warehouses.$.access": {"email": req.userEmail, "role": invite["role"]}}}
             )
-
-        # Einladung als angenommen markieren
         await db.invitations.update_one({"inviteId": req.inviteId}, {"$set": {"status": "accepted"}})
-
-        # Profil updaten
-        await db.profiles.update_one({"email": req.userEmail}, {"$set": {"companyId": company_id, "companyRole": invite["role"]}})
-
-        return {"success": True, "companyId": company_id, "folderId": folder_id}
+        await db.profiles.update_one(
+            {"email": req.userEmail},
+            {"$set": {"companyId": company_id, "companyRole": invite["role"]}}
+        )
+        return {"success": True, "companyId": company_id, "warehouseId": warehouse_id}
     except HTTPException:
         raise
     except Exception as e:
         logging.error(e)
         raise HTTPException(status_code=500, detail=str(e))
-
-# ─── ROLLEN ÄNDERN ────────────────────────────────
 
 @api_router.post("/company/role")
 async def change_role(req: GrantRoleRequest):
@@ -437,17 +448,9 @@ async def change_role(req: GrantRoleRequest):
         owner = next((m for m in company.get("members", []) if m["email"] == req.ownerEmail), None)
         if not owner or owner.get("role") not in ["owner", "admin"]:
             raise HTTPException(status_code=403, detail="Nur Chef oder Admin")
-
-        # Rolle ändern
         await db.companies.update_one(
             {"companyId": req.companyId, "members.email": req.targetEmail},
             {"$set": {"members.$.role": req.newRole}}
-        )
-        # Ordner Zugriff updaten
-        await db.companies.update_one(
-            {"companyId": req.companyId, "folders.folderId": req.folderId, "folders.access.email": req.targetEmail},
-            {"$set": {"folders.$[f].access.$[a].role": req.newRole}},
-            array_filters=[{"f.folderId": req.folderId}, {"a.email": req.targetEmail}]
         )
         return {"success": True}
     except HTTPException:
@@ -455,46 +458,57 @@ async def change_role(req: GrantRoleRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── FIRMA ORDNER SYNC ────────────────────────────
+@api_router.delete("/company/{company_id}/member/{email}")
+async def remove_member(company_id: str, email: str, owner_email: str):
+    try:
+        company = await db.companies.find_one({"companyId": company_id})
+        owner = next((m for m in company.get("members", []) if m["email"] == owner_email), None)
+        if not owner or owner.get("role") not in ["owner", "admin"]:
+            raise HTTPException(status_code=403, detail="Nur Chef oder Admin")
+        await db.companies.update_one({"companyId": company_id}, {"$pull": {"members": {"email": email}}})
+        await db.profiles.update_one({"email": email}, {"$unset": {"companyId": "", "companyRole": ""}})
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@api_router.post("/company/folder/sync")
-async def sync_company_folder(req: FolderSyncRequest):
+# ─── LAGER SYNC (Echtzeit) ────────────────────────
+
+@api_router.post("/company/warehouse/sync")
+async def sync_warehouse(req: WarehouseSyncRequest):
     try:
         company = await db.companies.find_one({"companyId": req.companyId})
         if not company:
             raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-
-        # Zugriff prüfen
-        folders = company.get("folders", [])
-        folder = next((f for f in folders if f["folderId"] == req.folderId), None)
-        if not folder:
-            raise HTTPException(status_code=404, detail="Ordner nicht gefunden")
-
-        user_access = next((a for a in folder.get("access", []) if a["email"] == req.userEmail), None)
+        warehouses = company.get("warehouses", [])
+        wh = next((w for w in warehouses if w["warehouseId"] == req.warehouseId), None)
+        if not wh:
+            raise HTTPException(status_code=404, detail="Lager nicht gefunden")
         member = next((m for m in company.get("members", []) if m["email"] == req.userEmail), None)
-        if not user_access and not (member and member.get("role") in ["owner", "admin"]):
+        access = next((a for a in wh.get("access", []) if a["email"] == req.userEmail), None)
+        if not access and not (member and member.get("role") in ["owner", "admin"]):
             raise HTTPException(status_code=403, detail="Kein Zugriff")
-
-        # Readonly darf nicht schreiben
-        if user_access and user_access.get("role") == "readonly":
+        if access and access.get("role") == "readonly":
             raise HTTPException(status_code=403, detail="Nur Lesezugriff")
-
         now = datetime.utcnow().isoformat()
         await db.companies.update_one(
-            {"companyId": req.companyId, "folders.folderId": req.folderId},
+            {"companyId": req.companyId, "warehouses.warehouseId": req.warehouseId},
             {"$set": {
-                "folders.$.materials": req.materials,
-                "folders.$.activities": req.activities,
-                "folders.$.lastSync": now,
-                "folders.$.lastSyncBy": req.userEmail,
+                "warehouses.$.materials": req.materials,
+                "warehouses.$.tasks": req.tasks,
+                "warehouses.$.activities": req.activities,
+                "warehouses.$.lastSync": now,
+                "warehouses.$.lastSyncBy": req.userEmail,
             }}
         )
-        # WebSocket broadcast
-        await manager.broadcast_to_folder(req.folderId, {
-            "type": "folder_updated",
-            "folderId": req.folderId,
+        # Echtzeit broadcast
+        await manager.broadcast(req.warehouseId, {
+            "type": "warehouse_updated",
+            "warehouseId": req.warehouseId,
             "updatedBy": req.userEmail,
             "materials": req.materials,
+            "tasks": req.tasks,
             "activities": req.activities,
             "syncedAt": now,
         })
@@ -505,29 +519,29 @@ async def sync_company_folder(req: FolderSyncRequest):
         logging.error(e)
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── FIRMA ORDNER LADEN ───────────────────────────
-
-@api_router.get("/company/{company_id}/folder/{folder_id}")
-async def get_company_folder(company_id: str, folder_id: str, email: str):
+@api_router.get("/company/{company_id}/warehouse/{warehouse_id}")
+async def get_warehouse(company_id: str, warehouse_id: str, email: str):
     try:
         company = await db.companies.find_one({"companyId": company_id})
         if not company:
             raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-        folder = next((f for f in company.get("folders", []) if f["folderId"] == folder_id), None)
-        if not folder:
-            raise HTTPException(status_code=404, detail="Ordner nicht gefunden")
-        # Zugriff prüfen
+        wh = next((w for w in company.get("warehouses", []) if w["warehouseId"] == warehouse_id), None)
+        if not wh:
+            raise HTTPException(status_code=404, detail="Lager nicht gefunden")
         member = next((m for m in company.get("members", []) if m["email"] == email), None)
-        access = next((a for a in folder.get("access", []) if a["email"] == email), None)
+        access = next((a for a in wh.get("access", []) if a["email"] == email), None)
         if not access and not (member and member.get("role") in ["owner", "admin"]):
             raise HTTPException(status_code=403, detail="Kein Zugriff")
         return {
-            "folderId": folder["folderId"],
-            "folderName": folder.get("folderName", ""),
-            "materials": folder.get("materials", []),
-            "activities": folder.get("activities", []),
-            "lastSync": folder.get("lastSync", ""),
-            "lastSyncBy": folder.get("lastSyncBy", ""),
+            "warehouseId": wh["warehouseId"],
+            "warehouseName": wh.get("warehouseName", ""),
+            "warehouseIcon": wh.get("warehouseIcon", "🏗️"),
+            "materials": wh.get("materials", []),
+            "tasks": wh.get("tasks", []),
+            "activities": wh.get("activities", []),
+            "lastSync": wh.get("lastSync", ""),
+            "lastSyncBy": wh.get("lastSyncBy", ""),
+            "access": wh.get("access", []),
             "userRole": access.get("role", "member") if access else member.get("role", "owner"),
         }
     except HTTPException:
@@ -535,17 +549,31 @@ async def get_company_folder(company_id: str, folder_id: str, email: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── MITGLIED ENTFERNEN ───────────────────────────
+# ─── LAGER ERSTELLEN (Chef) ───────────────────────
 
-@api_router.delete("/company/{company_id}/member/{email}")
-async def remove_member(company_id: str, email: str, owner_email: str):
+@api_router.post("/company/{company_id}/warehouse/create")
+async def create_warehouse(company_id: str, email: str, name: str, icon: str = "🏗️"):
     try:
         company = await db.companies.find_one({"companyId": company_id})
-        owner = next((m for m in company.get("members", []) if m["email"] == owner_email), None)
-        if not owner or owner.get("role") not in ["owner", "admin"]:
+        if not company:
+            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
+        member = next((m for m in company.get("members", []) if m["email"] == email), None)
+        if not member or member.get("role") not in ["owner", "admin"]:
             raise HTTPException(status_code=403, detail="Nur Chef oder Admin")
-        await db.companies.update_one({"companyId": company_id}, {"$pull": {"members": {"email": email}}})
-        return {"success": True}
+        wh_id = new_id()
+        warehouse = {
+            "warehouseId": wh_id,
+            "warehouseName": name,
+            "warehouseIcon": icon,
+            "access": [{"email": email, "role": "owner"}],
+            "materials": [],
+            "tasks": [],
+            "activities": [],
+            "lastSync": datetime.utcnow().isoformat(),
+            "lastSyncBy": email,
+        }
+        await db.companies.update_one({"companyId": company_id}, {"$push": {"warehouses": warehouse}})
+        return {"success": True, "warehouseId": wh_id}
     except HTTPException:
         raise
     except Exception as e:
@@ -555,9 +583,7 @@ async def remove_member(company_id: str, email: str, owner_email: str):
 
 @api_router.post("/chat", response_model=ChatResponse)
 async def chat_with_ai(request: ChatRequest):
-    system_message = """Du bist ein KI-Assistent für eine Materiallager App für Elektriker.
-Beantworte Fragen zu Elektrotechnik, Materialien, VDE-Normen und Installationen.
-Antworte immer auf Deutsch, klar und verständlich."""
+    system_message = "Du bist ein KI-Assistent für eine Materiallager App für Elektriker. Antworte auf Deutsch, klar und verständlich."
     try:
         completion = await ai_client.chat.completions.create(
             model="gpt-4o-mini", max_tokens=300, temperature=0.3,
@@ -565,15 +591,14 @@ Antworte immer auf Deutsch, klar und verständlich."""
         )
         return ChatResponse(response=completion.choices[0].message.content, actions_taken=[])
     except Exception as e:
-        logging.error(e)
         raise HTTPException(status_code=500, detail="KI Fehler")
 
 # ─── WEBSOCKET ────────────────────────────────────
 
-@app.websocket("/ws/folder/{folder_id}")
-async def websocket_folder(ws: WebSocket, folder_id: str, email: str = "", name: str = ""):
+@app.websocket("/ws/warehouse/{warehouse_id}")
+async def websocket_warehouse(ws: WebSocket, warehouse_id: str, email: str = "", name: str = ""):
     user_info = {"email": email, "name": name or email}
-    await manager.connect(ws, folder_id, user_info)
+    await manager.connect(ws, warehouse_id, user_info)
     try:
         while True:
             data = await ws.receive_json()
@@ -581,8 +606,8 @@ async def websocket_folder(ws: WebSocket, folder_id: str, email: str = "", name:
             if msg_type == "ping":
                 await ws.send_json({"type": "pong"})
             elif msg_type == "material_change":
-                # Sofort an alle anderen broadcasten
-                await manager.broadcast_to_folder(folder_id, {
+                # Sofort an alle anderen im Lager senden
+                await manager.broadcast(warehouse_id, {
                     "type": "material_change",
                     "materialId": data.get("materialId"),
                     "qty": data.get("qty"),
@@ -590,21 +615,18 @@ async def websocket_folder(ws: WebSocket, folder_id: str, email: str = "", name:
                     "changedByName": name,
                     "timestamp": datetime.utcnow().isoformat(),
                 }, exclude=ws)
-            elif msg_type == "typing":
-                await manager.broadcast_to_folder(folder_id, {
-                    "type": "user_active",
-                    "email": email,
-                    "name": name,
+            elif msg_type == "task_change":
+                await manager.broadcast(warehouse_id, {
+                    "type": "task_change",
+                    "taskId": data.get("taskId"),
+                    "status": data.get("status"),
+                    "changedBy": email,
                 }, exclude=ws)
     except WebSocketDisconnect:
-        folder_id = manager.disconnect(ws)
-        if folder_id:
-            await manager.broadcast_to_folder(folder_id, {
-                "type": "user_left",
-                "email": email,
-                "name": name,
-            })
-            await manager.broadcast_active_users(folder_id)
+        room = manager.disconnect(ws)
+        if room:
+            await manager.broadcast(room, {"type": "user_left", "email": email, "name": name})
+            await manager.broadcast_active_users(room)
 
 # ─── ROUTER ───────────────────────────────────────
 
