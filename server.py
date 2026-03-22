@@ -376,7 +376,11 @@ async def invite_member(req: InviteRequest):
 @api_router.get("/company/invites/{email}")
 async def get_invites(email: str):
     try:
-        invites = await db.invitations.find({"inviteeEmail": email, "status": "pending"}).to_list(50)
+        # NUR pending Einladungen zurückgeben — keine accepted/rejected
+        invites = await db.invitations.find({
+            "inviteeEmail": email,
+            "status": "pending"
+        }).to_list(50)
         for inv in invites:
             inv.pop("_id", None)
         return invites
