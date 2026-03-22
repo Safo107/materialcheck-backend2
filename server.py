@@ -6,6 +6,7 @@ from openai import AsyncOpenAI
 
 import os
 import logging
+import hashlib
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -86,6 +87,26 @@ class ProfileModel(BaseModel):
     email: str = ""
     logoUri: Optional[str] = None
     updatedAt: str = ""
+    pin: Optional[str] = None  # 6-stelliger PIN (gehashed gespeichert)
+
+
+class ProfileLoadRequest(BaseModel):
+    email: str
+    pin: str  # PIN zum Verifizieren
+
+
+class PinSetRequest(BaseModel):
+    deviceId: str
+    pin: str  # 6-stelliger PIN
+
+
+# -----------------------------
+# HELPER
+# -----------------------------
+
+def hash_pin(pin: str) -> str:
+    """PIN sicher hashen"""
+    return hashlib.sha256(pin.encode()).hexdigest()
 
 
 # -----------------------------
@@ -98,7 +119,7 @@ async def root():
 
 
 # -----------------------------
-# HEALTH CHECK (für Render)
+# HEALTH CHECK
 # -----------------------------
 
 @app.get("/health")
@@ -226,11 +247,18 @@ Wenn du eine Aktion ausführen willst, antworte im JSON Format:
 
 @api_router.post("/profile")
 async def save_profile(profile: ProfileModel):
-    """Profil speichern oder aktualisieren"""
+    """Profil speichern — PIN wird gehashed gespeichert"""
     try:
+        data = profile.model_dump()
+
+        # PIN hashen falls vorhanden
+        if data.get("pin"):
+            data["pinHash"] = hash_pin(data["pin"])
+        data.pop("pin", None)  # Klartext PIN nie speichern
+
         await db.profiles.update_one(
             {"deviceId": profile.deviceId},
-            {"$set": profile.model_dump()},
+            {"$set": data},
             upsert=True
         )
         return {"success": True, "message": "Profil gespeichert"}
@@ -239,15 +267,27 @@ async def save_profile(profile: ProfileModel):
         raise HTTPException(status_code=500, detail="Profil konnte nicht gespeichert werden")
 
 
-@api_router.get("/profile/by-email/{email}")
-async def get_profile_by_email(email: str):
-    """Profil anhand E-Mail laden"""
+@api_router.post("/profile/load")
+async def load_profile_with_pin(request: ProfileLoadRequest):
+    """Profil per E-Mail + PIN laden — sicher"""
     try:
-        profile = await db.profiles.find_one({"email": email})
+        profile = await db.profiles.find_one({"email": request.email})
         if not profile:
             raise HTTPException(status_code=404, detail="Kein Profil für diese E-Mail gefunden")
+
+        # PIN prüfen
+        stored_hash = profile.get("pinHash")
+        if not stored_hash:
+            raise HTTPException(status_code=400, detail="Kein PIN für dieses Profil gesetzt. Bitte zuerst einen PIN festlegen.")
+
+        if hash_pin(request.pin) != stored_hash:
+            raise HTTPException(status_code=401, detail="Falscher PIN")
+
+        # Sensible Felder entfernen
         profile.pop("_id", None)
+        profile.pop("pinHash", None)
         return profile
+
     except HTTPException:
         raise
     except Exception as e:
@@ -255,14 +295,36 @@ async def get_profile_by_email(email: str):
         raise HTTPException(status_code=500, detail="Fehler beim Laden")
 
 
+@api_router.get("/profile/by-email/{email}")
+async def get_profile_by_email(email: str):
+    """Prüfen ob Profil existiert (ohne PIN — nur Existenzprüfung)"""
+    try:
+        profile = await db.profiles.find_one({"email": email})
+        if not profile:
+            raise HTTPException(status_code=404, detail="Kein Profil gefunden")
+        has_pin = bool(profile.get("pinHash"))
+        return {
+            "exists": True,
+            "hasPin": has_pin,
+            "firmName": profile.get("firmName", ""),
+            "userName": profile.get("userName", ""),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler")
+
+
 @api_router.get("/profile/{device_id}")
 async def get_profile(device_id: str):
-    """Profil laden"""
+    """Profil per Device-ID laden (eigenes Gerät)"""
     try:
         profile = await db.profiles.find_one({"deviceId": device_id})
         if not profile:
             raise HTTPException(status_code=404, detail="Profil nicht gefunden")
         profile.pop("_id", None)
+        profile.pop("pinHash", None)
         return profile
     except HTTPException:
         raise
@@ -295,7 +357,7 @@ async def shutdown_db_client():
 
 
 # -----------------------------
-# START SERVER (Render)
+# START SERVER
 # -----------------------------
 
 if __name__ == "__main__":
