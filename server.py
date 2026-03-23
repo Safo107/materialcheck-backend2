@@ -281,6 +281,24 @@ async def create_company(req: CompanyCreateRequest):
         profile = await db.profiles.find_one({"email": req.ownerEmail})
         if not profile:
             raise HTTPException(status_code=404, detail="Profil nicht gefunden — zuerst Profil in Cloud speichern")
+
+        # Prüfen ob dieser Nutzer bereits Chef einer Firma ist → bestehende zurückgeben
+        existing_owner = await db.companies.find_one({"ownerEmail": req.ownerEmail})
+        if existing_owner:
+            return {
+                "success": True,
+                "companyId": existing_owner["companyId"],
+                "companyName": existing_owner["companyName"],
+                "alreadyExists": True
+            }
+
+        # Prüfen ob Firmenname bereits vergeben
+        name_taken = await db.companies.find_one({
+            "companyName": {"$regex": f"^{req.companyName.strip()}$", "$options": "i"}
+        })
+        if name_taken:
+            raise HTTPException(status_code=409, detail=f'Der Firmenname "{req.companyName}" ist bereits vergeben.')
+
         company_id = new_id()
         company = {
             "companyId": company_id,
@@ -295,14 +313,36 @@ async def create_company(req: CompanyCreateRequest):
                 "deviceId": req.deviceId,
                 "isActive": True,
             }],
-            "warehouses": [],  # Geteilte Lager
+            "warehouses": [],
         }
         await db.companies.insert_one(company)
         await db.profiles.update_one(
             {"email": req.ownerEmail},
             {"$set": {"companyId": company_id, "companyRole": "owner"}}
         )
-        return {"success": True, "companyId": company_id, "companyName": req.companyName}
+        return {"success": True, "companyId": company_id, "companyName": req.companyName, "alreadyExists": False}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/company/by-owner/{email}")
+async def get_company_by_owner(email: str):
+    """Firma anhand der Owner-Email finden — für Login-Wiederherstellung"""
+    try:
+        # Suche als Owner
+        company = await db.companies.find_one({"ownerEmail": email})
+        if not company:
+            # Suche als Mitglied
+            company = await db.companies.find_one({"members.email": email})
+        if not company:
+            raise HTTPException(status_code=404, detail="Keine Firma gefunden")
+        company.pop("_id", None)
+        return {
+            "companyId": company["companyId"],
+            "companyName": company["companyName"],
+            "ownerEmail": company["ownerEmail"],
+        }
     except HTTPException:
         raise
     except Exception as e:
