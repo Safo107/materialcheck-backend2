@@ -536,9 +536,16 @@ async def change_role(req: GrantRoleRequest):
         owner = next((m for m in company.get("members", []) if m["email"] == req.ownerEmail), None)
         if not owner or owner.get("role") not in ["owner", "admin"]:
             raise HTTPException(status_code=403, detail="Nur Chef oder Admin")
+        # Rolle in Firma updaten
         await db.companies.update_one(
             {"companyId": req.companyId, "members.email": req.targetEmail},
             {"$set": {"members.$.role": req.newRole}}
+        )
+        # WICHTIG: Auch das Profil des Nutzers updaten
+        # So bekommt der Nutzer beim nächsten App-Start die richtige Rolle
+        await db.profiles.update_one(
+            {"email": req.targetEmail},
+            {"$set": {"companyRole": req.newRole}}
         )
         return {"success": True}
     except HTTPException:
@@ -662,6 +669,25 @@ async def create_warehouse(company_id: str, email: str, name: str, icon: str = "
         }
         await db.companies.update_one({"companyId": company_id}, {"$push": {"warehouses": warehouse}})
         return {"success": True, "warehouseId": wh_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.delete("/company/{company_id}/warehouse/{warehouse_id}")
+async def delete_warehouse(company_id: str, warehouse_id: str, email: str):
+    try:
+        company = await db.companies.find_one({"companyId": company_id})
+        if not company:
+            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
+        member = next((m for m in company.get("members", []) if m["email"] == email), None)
+        if not member or member.get("role") not in ["owner", "admin"]:
+            raise HTTPException(status_code=403, detail="Nur Chef oder Admin")
+        await db.companies.update_one(
+            {"companyId": company_id},
+            {"$pull": {"warehouses": {"warehouseId": warehouse_id}}}
+        )
+        return {"success": True}
     except HTTPException:
         raise
     except Exception as e:
