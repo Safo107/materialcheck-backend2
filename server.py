@@ -413,6 +413,50 @@ async def invite_member(req: InviteRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@api_router.post("/company/reject")
+async def reject_invite(request: dict):
+    """Einladung ablehnen — als rejected markieren damit sie nie wiederkommt"""
+    try:
+        invite_id = request.get("inviteId", "")
+        if not invite_id:
+            raise HTTPException(status_code=400, detail="inviteId fehlt")
+        await db.invitations.update_one(
+            {"inviteId": invite_id},
+            {"$set": {"status": "rejected"}}
+        )
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.post("/company/{company_id}/leave")
+async def leave_company(company_id: str, email: str):
+    """Mitglied verlässt die Firma selbst"""
+    try:
+        company = await db.companies.find_one({"companyId": company_id})
+        if not company:
+            return {"success": True}  # Firma existiert nicht mehr — ok
+        # Owner kann nicht verlassen (muss Chef übertragen)
+        member = next((m for m in company.get("members", []) if m["email"] == email), None)
+        if member and member.get("role") == "owner":
+            raise HTTPException(status_code=403, detail="Chef kann die Firma nicht verlassen. Übertrage zuerst den Chef-Status.")
+        # Mitglied entfernen
+        await db.companies.update_one(
+            {"companyId": company_id},
+            {"$pull": {"members": {"email": email}}}
+        )
+        # Profil updaten
+        await db.profiles.update_one(
+            {"email": email},
+            {"$unset": {"companyId": "", "companyRole": ""}}
+        )
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @api_router.get("/company/invites/{email}")
 async def get_invites(email: str):
     try:
