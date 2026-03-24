@@ -557,9 +557,15 @@ async def change_role(req: GrantRoleRequest):
 async def remove_member(company_id: str, email: str, owner_email: str):
     try:
         company = await db.companies.find_one({"companyId": company_id})
+        
+        # ✅ FIX: None-Prüfung hinzufügen
+        if not company:
+            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
+        
         owner = next((m for m in company.get("members", []) if m["email"] == owner_email), None)
         if not owner or owner.get("role") not in ["owner", "admin"]:
             raise HTTPException(status_code=403, detail="Nur Chef oder Admin")
+        
         await db.companies.update_one({"companyId": company_id}, {"$pull": {"members": {"email": email}}})
         await db.profiles.update_one({"email": email}, {"$unset": {"companyId": "", "companyRole": ""}})
         return {"success": True}
