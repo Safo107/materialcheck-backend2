@@ -4,11 +4,13 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from openai import AsyncOpenAI
 
-import os, logging, hashlib, json, uuid
+import os, logging, hashlib, json, uuid, random, smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
-from datetime import datetime
+from datetime import datetime, timedelta
 import re, uvicorn
 
 ROOT_DIR = Path(__file__).parent
@@ -18,6 +20,10 @@ mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
 ai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+# Gmail SMTP Konfiguration
+GMAIL_USER = os.environ.get("GMAIL_USER", "safindeler10@gmail.com")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -136,6 +142,15 @@ class ChatResponse(BaseModel):
     response: str
     actions_taken: List[str] = []
 
+class PinResetRequest(BaseModel):
+    email: str
+
+class PinResetConfirmRequest(BaseModel):
+    email: str
+    code: str
+    newPin: str
+    deviceId: str = ""
+
 # ─── HELPERS ──────────────────────────────────────
 
 def hash_pin(pin: str) -> str:
@@ -143,6 +158,48 @@ def hash_pin(pin: str) -> str:
 
 def new_id() -> str:
     return str(uuid.uuid4())
+
+def send_reset_email(to_email: str, code: str, firm_name: str = "") -> bool:
+    """Send PIN reset code via Gmail SMTP"""
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "🔐 MaterialCheck — PIN zurücksetzen"
+        msg["From"] = GMAIL_USER
+        msg["To"] = to_email
+
+        name = firm_name or to_email
+        html = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; background: #0d1117; color: #e6edf3; padding: 20px;">
+            <div style="max-width: 500px; margin: 0 auto; background: #161b22; border-radius: 16px; padding: 30px; border: 1px solid rgba(255,255,255,0.1);">
+                <div style="text-align: center; margin-bottom: 24px;">
+                    <div style="font-size: 48px;">⚡</div>
+                    <h1 style="color: #f5a623; margin: 8px 0; font-size: 24px;">MaterialCheck</h1>
+                    <p style="color: #8b949e; font-size: 14px;">von ElektroGenius</p>
+                </div>
+                <h2 style="color: #e6edf3; font-size: 18px;">Hallo {name}!</h2>
+                <p style="color: #8b949e; line-height: 1.6;">Du hast einen PIN-Reset angefordert. Hier ist dein 6-stelliger Reset-Code:</p>
+                <div style="background: #21262d; border: 2px solid #f5a623; border-radius: 12px; padding: 24px; text-align: center; margin: 24px 0;">
+                    <div style="font-size: 42px; font-weight: bold; letter-spacing: 12px; color: #f5a623;">{code}</div>
+                    <p style="color: #8b949e; font-size: 12px; margin-top: 12px;">Gültig für 15 Minuten</p>
+                </div>
+                <p style="color: #8b949e; font-size: 13px; line-height: 1.6;">Falls du keinen Reset angefordert hast, kannst du diese Email ignorieren. Dein PIN bleibt unverändert.</p>
+                <div style="border-top: 1px solid rgba(255,255,255,0.1); margin-top: 24px; padding-top: 16px; text-align: center;">
+                    <p style="color: #6e7681; font-size: 11px;">MaterialCheck · ElektroGenius · elektrogenius.de</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        msg.attach(MIMEText(html, "html"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            server.sendmail(GMAIL_USER, to_email, msg.as_string())
+        return True
+    except Exception as e:
+        logging.error(f"Email send error: {e}")
+        return False
 
 # ─── HEALTH ───────────────────────────────────────
 
@@ -163,14 +220,12 @@ async def save_profile(profile: ProfileModel):
         if data.get("pin"):
             data["pinHash"] = hash_pin(data["pin"])
         data.pop("pin", None)
-        # Aktives Gerät tracken — nur 1 aktives Gerät pro Email
         data["lastActiveAt"] = datetime.utcnow().isoformat()
         await db.profiles.update_one(
             {"deviceId": profile.deviceId},
             {"$set": data},
             upsert=True
         )
-        # Andere Geräte mit gleicher Email als inaktiv markieren
         if profile.email:
             await db.profiles.update_many(
                 {"email": profile.email, "deviceId": {"$ne": profile.deviceId}},
@@ -191,19 +246,17 @@ async def load_profile(request: ProfileLoadRequest):
         if not request.pin or len(request.pin) != 6:
             raise HTTPException(status_code=400, detail="PIN muss 6 Stellen haben")
         profile = await db.profiles.find_one(
-    {"email": {"$regex": f"^{re.escape(request.email)}$", "$options": "i"}}
-)
+            {"email": {"$regex": f"^{re.escape(request.email)}$", "$options": "i"}}
+        )
         if not profile:
             raise HTTPException(status_code=404, detail="Kein Profil gefunden")
         if hash_pin(request.pin) != profile.get("pinHash", ""):
             raise HTTPException(status_code=401, detail="Falscher PIN")
-        # Altes Gerät abmelden, neues aktivieren
         if request.deviceId:
             await db.profiles.update_many(
                 {"email": request.email},
                 {"$set": {"isActive": False}}
             )
-            # Neues Gerät registrieren
             new_profile = {**profile, "deviceId": request.deviceId, "isActive": True, "lastActiveAt": datetime.utcnow().isoformat()}
             await db.profiles.update_one(
                 {"deviceId": request.deviceId},
@@ -223,8 +276,8 @@ async def load_profile(request: ProfileLoadRequest):
 @api_router.get("/profile/check/{email}")
 async def check_profile(email: str):
     profile = await db.profiles.find_one(
-    {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}
-)
+        {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}
+    )
     if not profile:
         raise HTTPException(status_code=404, detail="Nicht gefunden")
     return {
@@ -244,6 +297,102 @@ async def get_profile(device_id: str):
     profile.pop("_id", None)
     profile.pop("pinHash", None)
     return profile
+
+# ─── PIN RESET ────────────────────────────────────
+
+@api_router.post("/profile/reset-pin/request")
+async def request_pin_reset(req: PinResetRequest):
+    """Schickt einen 6-stelligen Reset-Code per Email"""
+    try:
+        profile = await db.profiles.find_one(
+            {"email": {"$regex": f"^{re.escape(req.email)}$", "$options": "i"}}
+        )
+        if not profile:
+            raise HTTPException(status_code=404, detail="Kein Profil mit dieser Email gefunden")
+
+        # 6-stelligen Code generieren
+        code = str(random.randint(100000, 999999))
+        expires_at = (datetime.utcnow() + timedelta(minutes=15)).isoformat()
+
+        # Code in DB speichern
+        await db.pin_resets.update_one(
+            {"email": req.email.lower()},
+            {"$set": {"code": hash_pin(code), "expiresAt": expires_at, "used": False}},
+            upsert=True
+        )
+
+        # Email senden
+        firm_name = profile.get("firmName", "") or profile.get("userName", "")
+        success = send_reset_email(req.email, code, firm_name)
+
+        if not success:
+            raise HTTPException(status_code=500, detail="Email konnte nicht gesendet werden")
+
+        return {"success": True, "message": "Reset-Code wurde per Email gesendet"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.post("/profile/reset-pin/confirm")
+async def confirm_pin_reset(req: PinResetConfirmRequest):
+    """Bestätigt den Reset-Code und setzt neuen PIN"""
+    try:
+        if not req.newPin or len(req.newPin) != 6:
+            raise HTTPException(status_code=400, detail="Neuer PIN muss 6 Stellen haben")
+
+        reset = await db.pin_resets.find_one({"email": req.email.lower()})
+        if not reset:
+            raise HTTPException(status_code=404, detail="Kein Reset angefordert")
+
+        if reset.get("used"):
+            raise HTTPException(status_code=400, detail="Code bereits verwendet")
+
+        expires_at = datetime.fromisoformat(reset["expiresAt"])
+        if datetime.utcnow() > expires_at:
+            raise HTTPException(status_code=400, detail="Code abgelaufen — bitte neu anfordern")
+
+        if hash_pin(req.code) != reset.get("code"):
+            raise HTTPException(status_code=401, detail="Falscher Code")
+
+        # Neuen PIN setzen
+        new_pin_hash = hash_pin(req.newPin)
+        await db.profiles.update_many(
+            {"email": {"$regex": f"^{re.escape(req.email)}$", "$options": "i"}},
+            {"$set": {"pinHash": new_pin_hash}}
+        )
+
+        # Code als verwendet markieren
+        await db.pin_resets.update_one(
+            {"email": req.email.lower()},
+            {"$set": {"used": True}}
+        )
+
+        # Profil laden und zurückgeben
+        profile = await db.profiles.find_one(
+            {"email": {"$regex": f"^{re.escape(req.email)}$", "$options": "i"}}
+        )
+        if profile and req.deviceId:
+            new_profile = {**profile, "deviceId": req.deviceId, "isActive": True}
+            await db.profiles.update_one(
+                {"deviceId": req.deviceId},
+                {"$set": new_profile},
+                upsert=True
+            )
+
+        if profile:
+            profile.pop("_id", None)
+            profile.pop("pinHash", None)
+            profile.pop("pin", None)
+            return {"success": True, "profile": profile}
+
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ─── MATERIALIEN SYNC (Privat) ────────────────────
 
@@ -286,7 +435,6 @@ async def create_company(req: CompanyCreateRequest):
         if not profile:
             raise HTTPException(status_code=404, detail="Profil nicht gefunden — zuerst Profil in Cloud speichern")
 
-        # Prüfen ob dieser Nutzer bereits Chef einer Firma ist → bestehende zurückgeben
         existing_owner = await db.companies.find_one({"ownerEmail": req.ownerEmail})
         if existing_owner:
             return {
@@ -296,7 +444,6 @@ async def create_company(req: CompanyCreateRequest):
                 "alreadyExists": True
             }
 
-        # Prüfen ob Firmenname bereits vergeben
         name_taken = await db.companies.find_one({
             "companyName": {"$regex": f"^{req.companyName.strip()}$", "$options": "i"}
         })
@@ -332,12 +479,9 @@ async def create_company(req: CompanyCreateRequest):
 
 @api_router.get("/company/by-owner/{email}")
 async def get_company_by_owner(email: str):
-    """Firma anhand der Owner-Email finden — für Login-Wiederherstellung"""
     try:
-        # Suche als Owner
         company = await db.companies.find_one({"ownerEmail": email})
         if not company:
-            # Suche als Mitglied
             company = await db.companies.find_one({"members.email": email})
         if not company:
             raise HTTPException(status_code=404, detail="Keine Firma gefunden")
@@ -392,7 +536,6 @@ async def invite_member(req: InviteRequest):
         inviter = next((m for m in company.get("members", []) if m["email"] == req.inviterEmail), None)
         if not inviter or inviter.get("role") not in ["owner", "admin"]:
             raise HTTPException(status_code=403, detail="Nur Chef oder Admin kann einladen")
-        # Prüfen ob Eingeladener ein Konto hat
         invitee_profile = await db.profiles.find_one({"email": req.inviteeEmail})
         if not invitee_profile:
             raise HTTPException(status_code=404, detail=f"Kein Konto mit Email {req.inviteeEmail} gefunden")
@@ -419,7 +562,6 @@ async def invite_member(req: InviteRequest):
 
 @api_router.post("/company/reject")
 async def reject_invite(request: dict):
-    """Einladung ablehnen — als rejected markieren damit sie nie wiederkommt"""
     try:
         invite_id = request.get("inviteId", "")
         if not invite_id:
@@ -436,21 +578,17 @@ async def reject_invite(request: dict):
 
 @api_router.post("/company/{company_id}/leave")
 async def leave_company(company_id: str, email: str):
-    """Mitglied verlässt die Firma selbst"""
     try:
         company = await db.companies.find_one({"companyId": company_id})
         if not company:
-            return {"success": True}  # Firma existiert nicht mehr — ok
-        # Owner kann nicht verlassen (muss Chef übertragen)
+            return {"success": True}
         member = next((m for m in company.get("members", []) if m["email"] == email), None)
         if member and member.get("role") == "owner":
-            raise HTTPException(status_code=403, detail="Chef kann die Firma nicht verlassen. Übertrage zuerst den Chef-Status.")
-        # Mitglied entfernen
+            raise HTTPException(status_code=403, detail="Chef kann die Firma nicht verlassen.")
         await db.companies.update_one(
             {"companyId": company_id},
             {"$pull": {"members": {"email": email}}}
         )
-        # Profil updaten
         await db.profiles.update_one(
             {"email": email},
             {"$unset": {"companyId": "", "companyRole": ""}}
@@ -464,7 +602,6 @@ async def leave_company(company_id: str, email: str):
 @api_router.get("/company/invites/{email}")
 async def get_invites(email: str):
     try:
-        # NUR pending Einladungen zurückgeben — keine accepted/rejected
         invites = await db.invitations.find({
             "inviteeEmail": email,
             "status": "pending"
@@ -508,9 +645,7 @@ async def accept_invite(req: AcceptInviteRequest):
                 "warehouseName": invite["warehouseName"],
                 "warehouseIcon": "🏗️",
                 "access": [{"email": req.userEmail, "role": invite["role"]}],
-                "materials": [],
-                "tasks": [],
-                "activities": [],
+                "materials": [], "tasks": [], "activities": [],
                 "lastSync": datetime.utcnow().isoformat(),
                 "lastSyncBy": req.userEmail,
             }}})
@@ -540,13 +675,10 @@ async def change_role(req: GrantRoleRequest):
         owner = next((m for m in company.get("members", []) if m["email"] == req.ownerEmail), None)
         if not owner or owner.get("role") not in ["owner", "admin"]:
             raise HTTPException(status_code=403, detail="Nur Chef oder Admin")
-        # Rolle in Firma updaten
         await db.companies.update_one(
             {"companyId": req.companyId, "members.email": req.targetEmail},
             {"$set": {"members.$.role": req.newRole}}
         )
-        # WICHTIG: Auch das Profil des Nutzers updaten
-        # So bekommt der Nutzer beim nächsten App-Start die richtige Rolle
         await db.profiles.update_one(
             {"email": req.targetEmail},
             {"$set": {"companyRole": req.newRole}}
@@ -561,15 +693,11 @@ async def change_role(req: GrantRoleRequest):
 async def remove_member(company_id: str, email: str, owner_email: str):
     try:
         company = await db.companies.find_one({"companyId": company_id})
-        
-        # ✅ FIX: None-Prüfung hinzufügen
         if not company:
             raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-        
         owner = next((m for m in company.get("members", []) if m["email"] == owner_email), None)
         if not owner or owner.get("role") not in ["owner", "admin"]:
             raise HTTPException(status_code=403, detail="Nur Chef oder Admin")
-        
         await db.companies.update_one({"companyId": company_id}, {"$pull": {"members": {"email": email}}})
         await db.profiles.update_one({"email": email}, {"$unset": {"companyId": "", "companyRole": ""}})
         return {"success": True}
@@ -578,7 +706,7 @@ async def remove_member(company_id: str, email: str, owner_email: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── LAGER SYNC (Echtzeit) ────────────────────────
+# ─── LAGER SYNC ───────────────────────────────────
 
 @api_router.post("/company/warehouse/sync")
 async def sync_warehouse(req: WarehouseSyncRequest):
@@ -607,7 +735,6 @@ async def sync_warehouse(req: WarehouseSyncRequest):
                 "warehouses.$.lastSyncBy": req.userEmail,
             }}
         )
-        # Echtzeit broadcast
         await manager.broadcast(req.warehouseId, {
             "type": "warehouse_updated",
             "warehouseId": req.warehouseId,
@@ -654,8 +781,6 @@ async def get_warehouse(company_id: str, warehouse_id: str, email: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── LAGER ERSTELLEN (Chef) ───────────────────────
-
 @api_router.post("/company/{company_id}/warehouse/create")
 async def create_warehouse(company_id: str, email: str, name: str, icon: str = "🏗️"):
     try:
@@ -671,9 +796,7 @@ async def create_warehouse(company_id: str, email: str, name: str, icon: str = "
             "warehouseName": name,
             "warehouseIcon": icon,
             "access": [{"email": email, "role": "owner"}],
-            "materials": [],
-            "tasks": [],
-            "activities": [],
+            "materials": [], "tasks": [], "activities": [],
             "lastSync": datetime.utcnow().isoformat(),
             "lastSyncBy": email,
         }
@@ -730,7 +853,6 @@ async def websocket_warehouse(ws: WebSocket, warehouse_id: str, email: str = "",
             if msg_type == "ping":
                 await ws.send_json({"type": "pong"})
             elif msg_type == "material_change":
-                # Sofort an alle anderen im Lager senden
                 await manager.broadcast(warehouse_id, {
                     "type": "material_change",
                     "materialId": data.get("materialId"),
