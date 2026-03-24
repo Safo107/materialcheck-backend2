@@ -203,7 +203,7 @@ def send_reset_email(to_email: str, code: str, firm_name: str = "") -> bool:
 
 # ─── HEALTH ───────────────────────────────────────
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"status": "ok"}
 
