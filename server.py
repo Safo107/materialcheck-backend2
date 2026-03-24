@@ -190,7 +190,9 @@ async def load_profile(request: ProfileLoadRequest):
     try:
         if not request.pin or len(request.pin) != 6:
             raise HTTPException(status_code=400, detail="PIN muss 6 Stellen haben")
-        profile = await db.profiles.find_one({"email": request.email})
+        profile = await db.profiles.find_one(
+    {"email": {"$regex": f"^{re.escape(request.email)}$", "$options": "i"}}
+)
         if not profile:
             raise HTTPException(status_code=404, detail="Kein Profil gefunden")
         if hash_pin(request.pin) != profile.get("pinHash", ""):
@@ -220,7 +222,9 @@ async def load_profile(request: ProfileLoadRequest):
 
 @api_router.get("/profile/check/{email}")
 async def check_profile(email: str):
-    profile = await db.profiles.find_one({"email": email})
+    profile = await db.profiles.find_one(
+    {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}
+)
     if not profile:
         raise HTTPException(status_code=404, detail="Nicht gefunden")
     return {
