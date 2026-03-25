@@ -258,7 +258,7 @@ async def load_profile(request: ProfileLoadRequest):
                 {"$set": {"isActive": False}}
             )
             profile.pop("_id", None)
-new_profile = {**profile, "deviceId": request.deviceId, "isActive": True, "lastActiveAt": datetime.utcnow().isoformat()}
+            new_profile = {**profile, "deviceId": request.deviceId, "isActive": True, "lastActiveAt": datetime.utcnow().isoformat()}
             await db.profiles.update_one(
                 {"deviceId": request.deviceId},
                 {"$set": new_profile},
