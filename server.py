@@ -20,7 +20,7 @@ db = client[os.environ["DB_NAME"]]
 ai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # Resend API
-RESEND_API_KEY = "re_7cTxYBB4_EXv9xKohWyhBjQ5dZpB866bg"
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
