@@ -4,9 +4,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from openai import AsyncOpenAI
 
-import os, logging, hashlib, json, uuid, random, smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import os, logging, hashlib, json, uuid, random, urllib.request
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
@@ -21,14 +19,13 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
 ai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-# Gmail SMTP Konfiguration
-GMAIL_USER = os.environ.get("GMAIL_USER", "safindeler10@gmail.com")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+# Resend API
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-# ─── WEBSOCKET MANAGER ────────────────────────────
+# ─── WEBSOCKET MANAGER ────────────────────────────────────────
 class ConnectionManager:
     def __init__(self):
         self.active: Dict[str, List[WebSocket]] = {}
@@ -71,7 +68,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# ─── MODELS ───────────────────────────────────────
+# ─── MODELS ───────────────────────────────────────────────────
 
 class ProfileModel(BaseModel):
     deviceId: str
@@ -151,7 +148,7 @@ class PinResetConfirmRequest(BaseModel):
     newPin: str
     deviceId: str = ""
 
-# ─── HELPERS ──────────────────────────────────────
+# ─── HELPERS ──────────────────────────────────────────────────
 
 def hash_pin(pin: str) -> str:
     return hashlib.sha256(pin.encode()).hexdigest()
@@ -160,20 +157,15 @@ def new_id() -> str:
     return str(uuid.uuid4())
 
 def send_reset_email(to_email: str, code: str, firm_name: str = "") -> bool:
-    """Send PIN reset code via Gmail SMTP"""
+    """Send PIN reset code via Resend API"""
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "🔐 MaterialCheck — PIN zurücksetzen"
-        msg["From"] = GMAIL_USER
-        msg["To"] = to_email
-
         name = firm_name or to_email
         html = f"""
         <html>
         <body style="font-family: Arial, sans-serif; background: #0d1117; color: #e6edf3; padding: 20px;">
             <div style="max-width: 500px; margin: 0 auto; background: #161b22; border-radius: 16px; padding: 30px; border: 1px solid rgba(255,255,255,0.1);">
                 <div style="text-align: center; margin-bottom: 24px;">
-                    <div style="font-size: 48px;">⚡</div>
+                    <div style="font-size: 48px;">&#9889;</div>
                     <h1 style="color: #f5a623; margin: 8px 0; font-size: 24px;">MaterialCheck</h1>
                     <p style="color: #8b949e; font-size: 14px;">von ElektroGenius</p>
                 </div>
@@ -181,27 +173,38 @@ def send_reset_email(to_email: str, code: str, firm_name: str = "") -> bool:
                 <p style="color: #8b949e; line-height: 1.6;">Du hast einen PIN-Reset angefordert. Hier ist dein 6-stelliger Reset-Code:</p>
                 <div style="background: #21262d; border: 2px solid #f5a623; border-radius: 12px; padding: 24px; text-align: center; margin: 24px 0;">
                     <div style="font-size: 42px; font-weight: bold; letter-spacing: 12px; color: #f5a623;">{code}</div>
-                    <p style="color: #8b949e; font-size: 12px; margin-top: 12px;">Gültig für 15 Minuten</p>
+                    <p style="color: #8b949e; font-size: 12px; margin-top: 12px;">Gueltig fuer 15 Minuten</p>
                 </div>
-                <p style="color: #8b949e; font-size: 13px; line-height: 1.6;">Falls du keinen Reset angefordert hast, kannst du diese Email ignorieren. Dein PIN bleibt unverändert.</p>
+                <p style="color: #8b949e; font-size: 13px; line-height: 1.6;">Falls du keinen Reset angefordert hast, kannst du diese Email ignorieren. Dein PIN bleibt unveraendert.</p>
                 <div style="border-top: 1px solid rgba(255,255,255,0.1); margin-top: 24px; padding-top: 16px; text-align: center;">
-                    <p style="color: #6e7681; font-size: 11px;">MaterialCheck · ElektroGenius · elektrogenius.de</p>
+                    <p style="color: #6e7681; font-size: 11px;">MaterialCheck &middot; ElektroGenius &middot; elektrogenius.de</p>
                 </div>
             </div>
         </body>
         </html>
         """
-        msg.attach(MIMEText(html, "html"))
-
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_USER, to_email, msg.as_string())
-        return True
+        payload = json.dumps({
+            "from": "MaterialCheck <safin.d@elektrogenius.de>",
+            "to": [to_email],
+            "subject": "MaterialCheck - PIN zuruecksetzen",
+            "html": html
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req) as resp:
+            return resp.status == 200
     except Exception as e:
-        logging.error(f"Email send error: {e}")
+        logging.error(f"Resend email error: {e}")
         return False
 
-# ─── HEALTH ───────────────────────────────────────
+# ─── HEALTH ───────────────────────────────────────────────────
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
@@ -209,9 +212,9 @@ async def health():
 
 @api_router.get("/")
 async def root():
-    return {"message": "MaterialCheck API v3 — Warehouse Edition"}
+    return {"message": "MaterialCheck API v3 - Warehouse Edition"}
 
-# ─── PROFIL ───────────────────────────────────────
+# ─── PROFIL ───────────────────────────────────────────────────
 
 @api_router.post("/profile")
 async def save_profile(profile: ProfileModel):
@@ -299,7 +302,7 @@ async def get_profile(device_id: str):
     profile.pop("pinHash", None)
     return profile
 
-# ─── PIN RESET ────────────────────────────────────
+# ─── PIN RESET ────────────────────────────────────────────────
 
 @api_router.post("/profile/reset-pin/request")
 async def request_pin_reset(req: PinResetRequest):
@@ -310,25 +313,17 @@ async def request_pin_reset(req: PinResetRequest):
         )
         if not profile:
             raise HTTPException(status_code=404, detail="Kein Profil mit dieser Email gefunden")
-
-        # 6-stelligen Code generieren
         code = str(random.randint(100000, 999999))
         expires_at = (datetime.utcnow() + timedelta(minutes=15)).isoformat()
-
-        # Code in DB speichern
         await db.pin_resets.update_one(
             {"email": req.email.lower()},
             {"$set": {"code": hash_pin(code), "expiresAt": expires_at, "used": False}},
             upsert=True
         )
-
-        # Email senden
         firm_name = profile.get("firmName", "") or profile.get("userName", "")
         success = send_reset_email(req.email, code, firm_name)
-
         if not success:
             raise HTTPException(status_code=500, detail="Email konnte nicht gesendet werden")
-
         return {"success": True, "message": "Reset-Code wurde per Email gesendet"}
     except HTTPException:
         raise
@@ -338,39 +333,29 @@ async def request_pin_reset(req: PinResetRequest):
 
 @api_router.post("/profile/reset-pin/confirm")
 async def confirm_pin_reset(req: PinResetConfirmRequest):
-    """Bestätigt den Reset-Code und setzt neuen PIN"""
+    """Bestaetigt den Reset-Code und setzt neuen PIN"""
     try:
         if not req.newPin or len(req.newPin) != 6:
             raise HTTPException(status_code=400, detail="Neuer PIN muss 6 Stellen haben")
-
         reset = await db.pin_resets.find_one({"email": req.email.lower()})
         if not reset:
             raise HTTPException(status_code=404, detail="Kein Reset angefordert")
-
         if reset.get("used"):
             raise HTTPException(status_code=400, detail="Code bereits verwendet")
-
         expires_at = datetime.fromisoformat(reset["expiresAt"])
         if datetime.utcnow() > expires_at:
-            raise HTTPException(status_code=400, detail="Code abgelaufen — bitte neu anfordern")
-
+            raise HTTPException(status_code=400, detail="Code abgelaufen - bitte neu anfordern")
         if hash_pin(req.code) != reset.get("code"):
             raise HTTPException(status_code=401, detail="Falscher Code")
-
-        # Neuen PIN setzen
         new_pin_hash = hash_pin(req.newPin)
         await db.profiles.update_many(
             {"email": {"$regex": f"^{re.escape(req.email)}$", "$options": "i"}},
             {"$set": {"pinHash": new_pin_hash}}
         )
-
-        # Code als verwendet markieren
         await db.pin_resets.update_one(
             {"email": req.email.lower()},
             {"$set": {"used": True}}
         )
-
-        # Profil laden und zurückgeben
         profile = await db.profiles.find_one(
             {"email": {"$regex": f"^{re.escape(req.email)}$", "$options": "i"}}
         )
@@ -381,13 +366,11 @@ async def confirm_pin_reset(req: PinResetConfirmRequest):
                 {"$set": new_profile},
                 upsert=True
             )
-
         if profile:
             profile.pop("_id", None)
             profile.pop("pinHash", None)
             profile.pop("pin", None)
             return {"success": True, "profile": profile}
-
         return {"success": True}
     except HTTPException:
         raise
@@ -395,7 +378,7 @@ async def confirm_pin_reset(req: PinResetConfirmRequest):
         logging.error(e)
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── MATERIALIEN SYNC (Privat) ────────────────────
+# ─── MATERIALIEN SYNC (Privat) ────────────────────────────────
 
 @api_router.post("/materials/sync")
 async def sync_materials(data: MaterialSyncModel):
@@ -427,15 +410,14 @@ async def get_synced_materials(email: str, pin: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── FIRMA ────────────────────────────────────────
+# ─── FIRMA ────────────────────────────────────────────────────
 
 @api_router.post("/company/create")
 async def create_company(req: CompanyCreateRequest):
     try:
         profile = await db.profiles.find_one({"email": req.ownerEmail})
         if not profile:
-            raise HTTPException(status_code=404, detail="Profil nicht gefunden — zuerst Profil in Cloud speichern")
-
+            raise HTTPException(status_code=404, detail="Profil nicht gefunden - zuerst Profil in Cloud speichern")
         existing_owner = await db.companies.find_one({"ownerEmail": req.ownerEmail})
         if existing_owner:
             return {
@@ -444,13 +426,11 @@ async def create_company(req: CompanyCreateRequest):
                 "companyName": existing_owner["companyName"],
                 "alreadyExists": True
             }
-
         name_taken = await db.companies.find_one({
             "companyName": {"$regex": f"^{req.companyName.strip()}$", "$options": "i"}
         })
         if name_taken:
             raise HTTPException(status_code=409, detail=f'Der Firmenname "{req.companyName}" ist bereits vergeben.')
-
         company_id = new_id()
         company = {
             "companyId": company_id,
@@ -526,7 +506,7 @@ async def get_company(company_id: str, email: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── EINLADUNGEN ──────────────────────────────────
+# ─── EINLADUNGEN ──────────────────────────────────────────────
 
 @api_router.post("/company/invite")
 async def invite_member(req: InviteRequest):
@@ -644,7 +624,7 @@ async def accept_invite(req: AcceptInviteRequest):
             await db.companies.update_one({"companyId": company_id}, {"$push": {"warehouses": {
                 "warehouseId": warehouse_id,
                 "warehouseName": invite["warehouseName"],
-                "warehouseIcon": "🏗️",
+                "warehouseIcon": "&#x1F3D7;",
                 "access": [{"email": req.userEmail, "role": invite["role"]}],
                 "materials": [], "tasks": [], "activities": [],
                 "lastSync": datetime.utcnow().isoformat(),
@@ -707,7 +687,7 @@ async def remove_member(company_id: str, email: str, owner_email: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── LAGER SYNC ───────────────────────────────────
+# ─── LAGER SYNC ───────────────────────────────────────────────
 
 @api_router.post("/company/warehouse/sync")
 async def sync_warehouse(req: WarehouseSyncRequest):
@@ -768,7 +748,7 @@ async def get_warehouse(company_id: str, warehouse_id: str, email: str):
         return {
             "warehouseId": wh["warehouseId"],
             "warehouseName": wh.get("warehouseName", ""),
-            "warehouseIcon": wh.get("warehouseIcon", "🏗️"),
+            "warehouseIcon": wh.get("warehouseIcon", "&#x1F3D7;"),
             "materials": wh.get("materials", []),
             "tasks": wh.get("tasks", []),
             "activities": wh.get("activities", []),
@@ -783,7 +763,7 @@ async def get_warehouse(company_id: str, warehouse_id: str, email: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.post("/company/{company_id}/warehouse/create")
-async def create_warehouse(company_id: str, email: str, name: str, icon: str = "🏗️"):
+async def create_warehouse(company_id: str, email: str, name: str, icon: str = "&#x1F3D7;"):
     try:
         company = await db.companies.find_one({"companyId": company_id})
         if not company:
@@ -827,21 +807,21 @@ async def delete_warehouse(company_id: str, warehouse_id: str, email: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── AI CHAT ──────────────────────────────────────
+# ─── AI CHAT ──────────────────────────────────────────────────
 
 @api_router.post("/chat", response_model=ChatResponse)
 async def chat_with_ai(request: ChatRequest):
-    system_message = "Du bist ein KI-Assistent für eine Materiallager App für Elektriker. Antworte auf Deutsch, klar und verständlich."
+    system_message = "Du bist ein KI-Assistent fuer eine Materiallager App fuer Elektriker. Antworte auf Deutsch, klar und verstaendlich."
     try:
         completion = await ai_client.chat.completions.create(
             model="gpt-4o-mini", max_tokens=300, temperature=0.3,
-            messages=[{"role":"system","content":system_message},{"role":"user","content":request.message}],
+            messages=[{"role": "system", "content": system_message}, {"role": "user", "content": request.message}],
         )
         return ChatResponse(response=completion.choices[0].message.content, actions_taken=[])
     except Exception as e:
         raise HTTPException(status_code=500, detail="KI Fehler")
 
-# ─── WEBSOCKET ────────────────────────────────────
+# ─── WEBSOCKET ────────────────────────────────────────────────
 
 @app.websocket("/ws/warehouse/{warehouse_id}")
 async def websocket_warehouse(ws: WebSocket, warehouse_id: str, email: str = "", name: str = ""):
@@ -875,7 +855,7 @@ async def websocket_warehouse(ws: WebSocket, warehouse_id: str, email: str = "",
             await manager.broadcast(room, {"type": "user_left", "email": email, "name": name})
             await manager.broadcast_active_users(room)
 
-# ─── ROUTER ───────────────────────────────────────
+# ─── ROUTER ───────────────────────────────────────────────────
 
 app.include_router(api_router)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
