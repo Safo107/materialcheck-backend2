@@ -1,74 +1,91 @@
-from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from openai import AsyncOpenAI
 
-import os, logging, hashlib, json, uuid, random, urllib.request
+import os
+import logging
+import hashlib
+import json
+import re
+import uuid
+import asyncio
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
-from datetime import datetime, timedelta
-import re, uvicorn
+from typing import List, Optional, Any, Dict
+from datetime import datetime
+import uvicorn
+
+# -----------------------------
+# ENV LOAD
+# -----------------------------
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
+# -----------------------------
+# DATABASE
+# -----------------------------
+
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
-ai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-# Resend API
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+# -----------------------------
+# OPENAI
+# -----------------------------
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+# -----------------------------
+# FASTAPI
+# -----------------------------
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-# ─── WEBSOCKET MANAGER ────────────────────────────────────────
-class ConnectionManager:
-    def __init__(self):
-        self.active: Dict[str, List[WebSocket]] = {}
-        self.users: Dict[WebSocket, dict] = {}
+# -----------------------------
+# HELPERS
+# -----------------------------
 
-    async def connect(self, ws: WebSocket, room: str, user_info: dict):
-        await ws.accept()
-        if room not in self.active:
-            self.active[room] = []
-        self.active[room].append(ws)
-        self.users[ws] = {**user_info, "room": room, "connectedAt": datetime.utcnow().isoformat()}
-        await self.broadcast_active_users(room)
+def hash_pin(pin: str) -> str:
+    return hashlib.sha256(pin.encode()).hexdigest()
 
-    def disconnect(self, ws: WebSocket):
-        room = self.users.get(ws, {}).get("room")
-        if room and room in self.active:
-            self.active[room] = [w for w in self.active[room] if w != ws]
-        self.users.pop(ws, None)
-        return room
+# WebSocket connections: { companyId: [ws, ws, ...] }
+company_connections: Dict[str, List[WebSocket]] = {}
 
-    async def broadcast(self, room: str, message: dict, exclude: WebSocket = None):
-        if room not in self.active:
-            return
-        dead = []
-        for ws in self.active[room]:
-            if ws == exclude:
-                continue
-            try:
-                await ws.send_json(message)
-            except:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
+# -----------------------------
+# MODELS
+# -----------------------------
 
-    async def broadcast_active_users(self, room: str):
-        if room not in self.active:
-            return
-        users = [self.users[ws] for ws in self.active[room] if ws in self.users]
-        await self.broadcast(room, {"type": "active_users", "users": users})
+class Article(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    folder_id: str = ""
+    name: str
+    current_stock: int = 0
+    min_stock: int = 0
+    unit: str = "Stück"
+    category: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-manager = ConnectionManager()
+class ArticleCreate(BaseModel):
+    name: str
+    folder_id: str = ""
+    current_stock: int = 0
+    min_stock: int = 0
+    unit: str = "Stück"
+    category: str = ""
 
-# ─── MODELS ───────────────────────────────────────────────────
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str = "default"
+
+class ChatResponse(BaseModel):
+    response: str
+    actions_taken: List[str] = []
 
 class ProfileModel(BaseModel):
     deviceId: str
@@ -77,24 +94,29 @@ class ProfileModel(BaseModel):
     email: str = ""
     logoUri: Optional[str] = None
     updatedAt: str = ""
-    pin: Optional[str] = None
+    hasPin: bool = False
     companyId: Optional[str] = None
     companyRole: Optional[str] = None
+    pin: Optional[str] = None  # hashed PIN, only set when explicitly provided
 
 class ProfileLoadRequest(BaseModel):
     email: str
     pin: str
-    deviceId: str = ""
+    deviceId: str
 
-class MaterialSyncModel(BaseModel):
+class MaterialsSyncRequest(BaseModel):
     deviceId: str
     email: str
-    folders: list = []
-    materials: list = []
-    tasks: list = []
-    suppliers: list = []
-    loans: list = []
+    folders: List[Any] = []
+    materials: List[Any] = []
+    tasks: List[Any] = []
+    suppliers: List[Any] = []
+    loans: List[Any] = []
     syncedAt: str = ""
+
+class MaterialsLoadRequest(BaseModel):
+    email: str
+    pin: str
 
 class CompanyCreateRequest(BaseModel):
     ownerEmail: str
@@ -106,763 +128,673 @@ class InviteRequest(BaseModel):
     companyId: str
     inviterEmail: str
     inviteeEmail: str
-    warehouseId: str
-    warehouseName: str
     role: str = "member"
 
 class AcceptInviteRequest(BaseModel):
     inviteId: str
-    userEmail: str
+    email: str
     deviceId: str
+    userName: str = ""
 
-class GrantRoleRequest(BaseModel):
+class RejectInviteRequest(BaseModel):
+    inviteId: str
+    email: str
+
+class ChangeRoleRequest(BaseModel):
     companyId: str
     ownerEmail: str
     targetEmail: str
-    warehouseId: str
     newRole: str
 
 class WarehouseSyncRequest(BaseModel):
     companyId: str
     warehouseId: str
-    userEmail: str
-    materials: list = []
-    tasks: list = []
-    activities: list = []
+    email: str
+    materials: List[Any] = []
     syncedAt: str = ""
 
-class ChatRequest(BaseModel):
-    message: str
-    session_id: str = "default"
-
-class ChatResponse(BaseModel):
-    response: str
-    actions_taken: List[str] = []
-
-class PinResetRequest(BaseModel):
-    email: str
-
-class PinResetConfirmRequest(BaseModel):
-    email: str
-    code: str
-    newPin: str
-    deviceId: str = ""
-
-# ─── HELPERS ──────────────────────────────────────────────────
-
-def hash_pin(pin: str) -> str:
-    return hashlib.sha256(pin.encode()).hexdigest()
-
-def new_id() -> str:
-    return str(uuid.uuid4())
-
-def send_reset_email(to_email: str, code: str, firm_name: str = "") -> bool:
-    """Send PIN reset code via Resend API"""
-    try:
-        name = firm_name or to_email
-        html = f"""
-        <html>
-        <body style="font-family: Arial, sans-serif; background: #0d1117; color: #e6edf3; padding: 20px;">
-            <div style="max-width: 500px; margin: 0 auto; background: #161b22; border-radius: 16px; padding: 30px; border: 1px solid rgba(255,255,255,0.1);">
-                <div style="text-align: center; margin-bottom: 24px;">
-                    <div style="font-size: 48px;">&#9889;</div>
-                    <h1 style="color: #f5a623; margin: 8px 0; font-size: 24px;">MaterialCheck</h1>
-                    <p style="color: #8b949e; font-size: 14px;">von ElektroGenius</p>
-                </div>
-                <h2 style="color: #e6edf3; font-size: 18px;">Hallo {name}!</h2>
-                <p style="color: #8b949e; line-height: 1.6;">Du hast einen PIN-Reset angefordert. Hier ist dein 6-stelliger Reset-Code:</p>
-                <div style="background: #21262d; border: 2px solid #f5a623; border-radius: 12px; padding: 24px; text-align: center; margin: 24px 0;">
-                    <div style="font-size: 42px; font-weight: bold; letter-spacing: 12px; color: #f5a623;">{code}</div>
-                    <p style="color: #8b949e; font-size: 12px; margin-top: 12px;">Gueltig fuer 15 Minuten</p>
-                </div>
-                <p style="color: #8b949e; font-size: 13px; line-height: 1.6;">Falls du keinen Reset angefordert hast, kannst du diese Email ignorieren. Dein PIN bleibt unveraendert.</p>
-                <div style="border-top: 1px solid rgba(255,255,255,0.1); margin-top: 24px; padding-top: 16px; text-align: center;">
-                    <p style="color: #6e7681; font-size: 11px;">MaterialCheck &middot; ElektroGenius &middot; elektrogenius.de</p>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        payload = json.dumps({
-            "from": "MaterialCheck <safin.d@elektrogenius.de>",
-            "to": [to_email],
-            "subject": "MaterialCheck - PIN zuruecksetzen",
-            "html": html
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            "https://api.resend.com/emails",
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {RESEND_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req) as resp:
-            return resp.status == 200
-    except Exception as e:
-        logging.error(f"Resend email error: {e}")
-        return False
-
-# ─── HEALTH ───────────────────────────────────────────────────
-
-@app.api_route("/health", methods=["GET", "HEAD"])
-async def health():
-    return {"status": "ok"}
+# -----------------------------
+# ROOT
+# -----------------------------
 
 @api_router.get("/")
 async def root():
-    return {"message": "MaterialCheck API v3 - Warehouse Edition"}
+    return {"message": "MaterialCheck API läuft"}
 
-# ─── PROFIL ───────────────────────────────────────────────────
+# -----------------------------
+# HEALTH CHECK
+# -----------------------------
+
+@app.get("/health")
+@api_router.get("/health")
+async def health():
+    return {"status": "ok"}
+
+# -----------------------------
+# ARTICLES
+# -----------------------------
+
+@api_router.get("/articles", response_model=List[Article])
+async def get_articles():
+    articles = await db.articles.find().limit(50).to_list(50)
+    return [Article(**a) for a in articles]
+
+@api_router.post("/articles", response_model=Article)
+async def create_article(input: ArticleCreate):
+    article = Article(**input.model_dump())
+    await db.articles.insert_one(article.model_dump())
+    return article
+
+@api_router.delete("/articles/{article_id}")
+async def delete_article(article_id: str):
+    result = await db.articles.delete_one({"id": article_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Artikel nicht gefunden")
+    return {"message": "Artikel gelöscht"}
+
+# -----------------------------
+# AI CHAT
+# -----------------------------
+
+@api_router.post("/chat", response_model=ChatResponse)
+async def chat_with_ai(request: ChatRequest):
+    articles = await db.articles.find().limit(50).to_list(50)
+    articles_list = [Article(**a) for a in articles]
+    inventory_context = "Aktuelle Artikel im Inventar:\n"
+    for a in articles_list:
+        inventory_context += f"- {a.name}: {a.current_stock} {a.unit}\n"
+    system_message = f"""
+Du bist ein KI-Assistent für eine Materiallager App für Elektriker.
+Du kannst:
+- Artikel hinzufügen
+- Bestand erhöhen oder reduzieren
+- Einkaufslisten erstellen
+
+{inventory_context}
+
+Wenn du eine Aktion ausführen willst, antworte im JSON Format:
+{{
+"action": "add_article | adjust_stock | none",
+"data": {{}},
+"message": "Antwort an den Benutzer"
+}}
+"""
+    try:
+        completion = await ai_client.chat.completions.create(
+            model="gpt-4o-mini", max_tokens=200, temperature=0.2,
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": request.message},
+            ],
+        )
+        response = completion.choices[0].message.content
+        actions_taken = []
+        final_response = response
+        json_match = re.search(r"\{.*\}", response, re.DOTALL)
+        if json_match:
+            action_data = json.loads(json_match.group(0))
+            action = action_data.get("action")
+            data = action_data.get("data", {})
+            message = action_data.get("message", response)
+            if action == "add_article":
+                article = ArticleCreate(name=data.get("name", "Neuer Artikel"), current_stock=data.get("current_stock", 0), min_stock=data.get("min_stock", 5))
+                new_article = Article(**article.model_dump())
+                await db.articles.insert_one(new_article.model_dump())
+                actions_taken.append(f"Artikel {article.name} hinzugefügt")
+            if action == "adjust_stock":
+                article_name = data.get("article_name")
+                amount = data.get("amount", 0)
+                article = await db.articles.find_one({"name": {"$regex": f"^{re.escape(article_name)}$", "$options": "i"}})
+                if article:
+                    new_stock = max(0, article["current_stock"] + amount)
+                    await db.articles.update_one({"id": article["id"]}, {"$set": {"current_stock": new_stock}})
+                    actions_taken.append(f"Bestand von {article['name']} geändert ({amount})")
+            final_response = message
+        return ChatResponse(response=final_response, actions_taken=actions_taken)
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="KI Fehler")
+
+# -----------------------------
+# PROFIL
+# -----------------------------
 
 @api_router.post("/profile")
 async def save_profile(profile: ProfileModel):
+    """Profil speichern — PIN wird gehashed wenn mitgeliefert"""
     try:
         data = profile.model_dump()
-        if data.get("pin"):
-            data["pinHash"] = hash_pin(data["pin"])
-        data.pop("pin", None)
-        data["lastActiveAt"] = datetime.utcnow().isoformat()
+        # Hash PIN if provided in plaintext (6 chars or less = plain)
+        if data.get("pin") and len(data["pin"]) <= 6:
+            data["pin"] = hash_pin(data["pin"])
+        # Don't overwrite existing PIN with None
+        existing = None
+        if data.get("email"):
+            existing = await db.profiles.find_one({"email": data["email"]})
+        if not existing:
+            existing = await db.profiles.find_one({"deviceId": data["deviceId"]})
+        if existing and not data.get("pin") and existing.get("pin"):
+            data["pin"] = existing["pin"]
+            data["hasPin"] = True
         await db.profiles.update_one(
-            {"deviceId": profile.deviceId},
+            {"deviceId": data["deviceId"]},
             {"$set": data},
             upsert=True
         )
-        if profile.email:
-            await db.profiles.update_many(
-                {"email": profile.email, "deviceId": {"$ne": profile.deviceId}},
-                {"$set": {"isActive": False}}
-            )
-            await db.profiles.update_one(
-                {"deviceId": profile.deviceId},
-                {"$set": {"isActive": True}}
-            )
+        # If email changed, update old email record too
+        if existing and existing.get("email") != data.get("email") and data.get("email"):
+            await db.profiles.update_one({"email": data["email"]}, {"$set": data}, upsert=True)
         return {"success": True}
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Profil konnte nicht gespeichert werden")
+
+@api_router.get("/profile/check/{email}")
+async def check_profile_by_email(email: str):
+    """Prüfen ob Profil mit dieser Email existiert"""
+    try:
+        profile = await db.profiles.find_one({"email": email})
+        if not profile:
+            raise HTTPException(status_code=404, detail="Kein Profil gefunden")
+        profile.pop("_id", None)
+        return {
+            "exists": True,
+            "hasPin": bool(profile.get("pin") or profile.get("hasPin")),
+            "firmName": profile.get("firmName", ""),
+            "userName": profile.get("userName", ""),
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(e)
         raise HTTPException(status_code=500, detail="Fehler")
 
 @api_router.post("/profile/load")
-async def load_profile(request: ProfileLoadRequest):
+async def load_profile_with_pin(req: ProfileLoadRequest):
+    """Profil mit Email + PIN laden"""
     try:
-        if not request.pin or len(request.pin) != 6:
-            raise HTTPException(status_code=400, detail="PIN muss 6 Stellen haben")
-        profile = await db.profiles.find_one(
-            {"email": {"$regex": f"^{re.escape(request.email)}$", "$options": "i"}}
-        )
+        profile = await db.profiles.find_one({"email": req.email})
         if not profile:
             raise HTTPException(status_code=404, detail="Kein Profil gefunden")
-        if hash_pin(request.pin) != profile.get("pinHash", ""):
+        stored_pin = profile.get("pin")
+        if not stored_pin:
+            raise HTTPException(status_code=401, detail="Kein PIN gesetzt")
+        if stored_pin != hash_pin(req.pin):
             raise HTTPException(status_code=401, detail="Falscher PIN")
-        if request.deviceId:
-            await db.profiles.update_many(
-                {"email": request.email},
-                {"$set": {"isActive": False}}
-            )
-            profile.pop("_id", None)
-            new_profile = {**profile, "deviceId": request.deviceId, "isActive": True, "lastActiveAt": datetime.utcnow().isoformat()}
-            await db.profiles.update_one(
-                {"deviceId": request.deviceId},
-                {"$set": new_profile},
-                upsert=True
-            )
         profile.pop("_id", None)
-        profile.pop("pinHash", None)
+        profile.pop("pin", None)
+        profile["hasPin"] = True
+        profile["deviceId"] = req.deviceId  # Update device ID
+        # Update device ID in DB
+        await db.profiles.update_one({"email": req.email}, {"$set": {"deviceId": req.deviceId}})
+        return profile
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler beim Laden")
+
+@api_router.get("/profile/{device_id}")
+async def get_profile(device_id: str):
+    """Profil per DeviceID laden"""
+    try:
+        profile = await db.profiles.find_one({"deviceId": device_id})
+        if not profile:
+            raise HTTPException(status_code=404, detail="Profil nicht gefunden")
+        profile.pop("_id", None)
         profile.pop("pin", None)
         return profile
     except HTTPException:
         raise
     except Exception as e:
         logging.error(e)
-        raise HTTPException(status_code=500, detail="Fehler")
+        raise HTTPException(status_code=500, detail="Profil konnte nicht geladen werden")
 
-@api_router.get("/profile/check/{email}")
-async def check_profile(email: str):
-    profile = await db.profiles.find_one(
-        {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}
-    )
-    if not profile:
-        raise HTTPException(status_code=404, detail="Nicht gefunden")
-    return {
-        "exists": True,
-        "hasPin": bool(profile.get("pinHash")),
-        "firmName": profile.get("firmName", ""),
-        "userName": profile.get("userName", ""),
-        "companyId": profile.get("companyId", ""),
-        "companyRole": profile.get("companyRole", ""),
-    }
-
-@api_router.get("/profile/{device_id}")
-async def get_profile(device_id: str):
-    profile = await db.profiles.find_one({"deviceId": device_id})
-    if not profile:
-        raise HTTPException(status_code=404, detail="Nicht gefunden")
-    profile.pop("_id", None)
-    profile.pop("pinHash", None)
-    return profile
-
-# ─── PIN RESET ────────────────────────────────────────────────
-
-@api_router.post("/profile/reset-pin/request")
-async def request_pin_reset(req: PinResetRequest):
-    """Schickt einen 6-stelligen Reset-Code per Email"""
-    try:
-        profile = await db.profiles.find_one(
-            {"email": {"$regex": f"^{re.escape(req.email)}$", "$options": "i"}}
-        )
-        if not profile:
-            raise HTTPException(status_code=404, detail="Kein Profil mit dieser Email gefunden")
-        code = str(random.randint(100000, 999999))
-        expires_at = (datetime.utcnow() + timedelta(minutes=15)).isoformat()
-        await db.pin_resets.update_one(
-            {"email": req.email.lower()},
-            {"$set": {"code": hash_pin(code), "expiresAt": expires_at, "used": False}},
-            upsert=True
-        )
-        firm_name = profile.get("firmName", "") or profile.get("userName", "")
-        success = send_reset_email(req.email, code, firm_name)
-        if not success:
-            raise HTTPException(status_code=500, detail="Email konnte nicht gesendet werden")
-        return {"success": True, "message": "Reset-Code wurde per Email gesendet"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.post("/profile/reset-pin/confirm")
-async def confirm_pin_reset(req: PinResetConfirmRequest):
-    """Bestaetigt den Reset-Code und setzt neuen PIN"""
-    try:
-        if not req.newPin or len(req.newPin) != 6:
-            raise HTTPException(status_code=400, detail="Neuer PIN muss 6 Stellen haben")
-        reset = await db.pin_resets.find_one({"email": req.email.lower()})
-        if not reset:
-            raise HTTPException(status_code=404, detail="Kein Reset angefordert")
-        if reset.get("used"):
-            raise HTTPException(status_code=400, detail="Code bereits verwendet")
-        expires_at = datetime.fromisoformat(reset["expiresAt"])
-        if datetime.utcnow() > expires_at:
-            raise HTTPException(status_code=400, detail="Code abgelaufen - bitte neu anfordern")
-        if hash_pin(req.code) != reset.get("code"):
-            raise HTTPException(status_code=401, detail="Falscher Code")
-        new_pin_hash = hash_pin(req.newPin)
-        await db.profiles.update_many(
-            {"email": {"$regex": f"^{re.escape(req.email)}$", "$options": "i"}},
-            {"$set": {"pinHash": new_pin_hash}}
-        )
-        await db.pin_resets.update_one(
-            {"email": req.email.lower()},
-            {"$set": {"used": True}}
-        )
-        profile = await db.profiles.find_one(
-            {"email": {"$regex": f"^{re.escape(req.email)}$", "$options": "i"}}
-        )
-        if profile and req.deviceId:
-            new_profile = {**profile, "deviceId": req.deviceId, "isActive": True}
-            await db.profiles.update_one(
-                {"deviceId": req.deviceId},
-                {"$set": new_profile},
-                upsert=True
-            )
-        if profile:
-            profile.pop("_id", None)
-            profile.pop("pinHash", None)
-            profile.pop("pin", None)
-            return {"success": True, "profile": profile}
-        return {"success": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ─── MATERIALIEN SYNC (Privat) ────────────────────────────────
+# -----------------------------
+# MATERIALIEN SYNC
+# -----------------------------
 
 @api_router.post("/materials/sync")
-async def sync_materials(data: MaterialSyncModel):
+async def sync_materials(req: MaterialsSyncRequest):
+    """Materialien in Cloud speichern"""
     try:
-        sync_data = data.model_dump()
-        sync_data["syncedAt"] = datetime.utcnow().isoformat()
-        await db.material_syncs.update_one({"email": data.email}, {"$set": sync_data}, upsert=True)
-        return {"success": True, "syncedAt": sync_data["syncedAt"]}
+        data = {
+            "deviceId": req.deviceId,
+            "email": req.email,
+            "folders": req.folders,
+            "materials": req.materials,
+            "tasks": req.tasks,
+            "suppliers": req.suppliers,
+            "loans": req.loans,
+            "syncedAt": req.syncedAt or datetime.utcnow().isoformat(),
+        }
+        # Upsert by email (primary) or deviceId
+        filter_q = {"email": req.email} if req.email else {"deviceId": req.deviceId}
+        await db.materials_sync.update_one(filter_q, {"$set": data}, upsert=True)
+        return {"success": True, "message": f"{len(req.materials)} Materialien gespeichert"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Sync fehlgeschlagen")
 
-@api_router.get("/materials/sync/{email}")
-async def get_synced_materials(email: str, pin: str):
+@api_router.post("/materials/load")
+async def load_materials(req: MaterialsLoadRequest):
+    """Materialien mit Email + PIN laden"""
     try:
-        if not pin or len(pin) != 6:
-            raise HTTPException(status_code=400, detail="PIN erforderlich")
-        profile = await db.profiles.find_one({"email": email})
+        profile = await db.profiles.find_one({"email": req.email})
         if not profile:
-            raise HTTPException(status_code=404, detail="Kein Profil")
-        if hash_pin(pin) != profile.get("pinHash", ""):
+            raise HTTPException(status_code=404, detail="Kein Profil gefunden")
+        if profile.get("pin") and profile["pin"] != hash_pin(req.pin):
             raise HTTPException(status_code=401, detail="Falscher PIN")
-        sync = await db.material_syncs.find_one({"email": email})
-        if not sync:
-            raise HTTPException(status_code=404, detail="Keine Daten")
-        sync.pop("_id", None)
-        return sync
+        sync_data = await db.materials_sync.find_one({"email": req.email})
+        if not sync_data:
+            return {"folders": [], "materials": [], "tasks": [], "suppliers": [], "loans": [], "syncedAt": ""}
+        sync_data.pop("_id", None)
+        return sync_data
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Laden fehlgeschlagen")
 
-# ─── FIRMA ────────────────────────────────────────────────────
+# -----------------------------
+# FIRMA / COMPANY
+# -----------------------------
 
 @api_router.post("/company/create")
 async def create_company(req: CompanyCreateRequest):
+    """Firma erstellen"""
     try:
-        profile = await db.profiles.find_one({"email": req.ownerEmail})
-        if not profile:
-            raise HTTPException(status_code=404, detail="Profil nicht gefunden - zuerst Profil in Cloud speichern")
-        existing_owner = await db.companies.find_one({"ownerEmail": req.ownerEmail})
-        if existing_owner:
-            return {
-                "success": True,
-                "companyId": existing_owner["companyId"],
-                "companyName": existing_owner["companyName"],
-                "alreadyExists": True
-            }
-        name_taken = await db.companies.find_one({
-            "companyName": {"$regex": f"^{req.companyName.strip()}$", "$options": "i"}
-        })
-        if name_taken:
-            raise HTTPException(status_code=409, detail=f'Der Firmenname "{req.companyName}" ist bereits vergeben.')
-        company_id = new_id()
+        # Check if owner already has a company
+        existing = await db.companies.find_one({"ownerEmail": req.ownerEmail})
+        if existing:
+            existing.pop("_id", None)
+            return {"success": True, "company": existing}
+        company_id = str(uuid.uuid4())
         company = {
             "companyId": company_id,
             "companyName": req.companyName,
             "ownerEmail": req.ownerEmail,
-            "createdAt": datetime.utcnow().isoformat(),
+            "ownerName": req.ownerName,
             "members": [{
                 "email": req.ownerEmail,
                 "name": req.ownerName,
                 "role": "owner",
-                "joinedAt": datetime.utcnow().isoformat(),
                 "deviceId": req.deviceId,
-                "isActive": True,
+                "joinedAt": datetime.utcnow().isoformat(),
             }],
             "warehouses": [],
+            "createdAt": datetime.utcnow().isoformat(),
         }
         await db.companies.insert_one(company)
-        await db.profiles.update_one(
-            {"email": req.ownerEmail},
-            {"$set": {"companyId": company_id, "companyRole": "owner"}}
-        )
-        return {"success": True, "companyId": company_id, "companyName": req.companyName, "alreadyExists": False}
-    except HTTPException:
-        raise
+        company.pop("_id", None)
+        return {"success": True, "company": company}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Firma konnte nicht erstellt werden")
 
 @api_router.get("/company/by-owner/{email}")
 async def get_company_by_owner(email: str):
+    """Firma per Owner-Email laden"""
     try:
         company = await db.companies.find_one({"ownerEmail": email})
         if not company:
+            # Check if member
             company = await db.companies.find_one({"members.email": email})
         if not company:
             raise HTTPException(status_code=404, detail="Keine Firma gefunden")
         company.pop("_id", None)
-        return {
-            "companyId": company["companyId"],
-            "companyName": company["companyName"],
-            "ownerEmail": company["ownerEmail"],
-        }
+        return company
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.get("/company/{company_id}")
-async def get_company(company_id: str, email: str):
-    try:
-        company = await db.companies.find_one({"companyId": company_id})
-        if not company:
-            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-        company.pop("_id", None)
-        member = next((m for m in company.get("members", []) if m["email"] == email), None)
-        if not member:
-            raise HTTPException(status_code=403, detail="Kein Zugriff")
-        user_role = member.get("role", "member")
-        if user_role in ["owner", "admin"]:
-            warehouses = company.get("warehouses", [])
-        else:
-            warehouses = [w for w in company.get("warehouses", [])
-                         if any(a["email"] == email for a in w.get("access", []))]
-        return {
-            "companyId": company["companyId"],
-            "companyName": company["companyName"],
-            "ownerEmail": company["ownerEmail"],
-            "members": company.get("members", []),
-            "warehouses": warehouses,
-            "userRole": user_role,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ─── EINLADUNGEN ──────────────────────────────────────────────
-
-@api_router.post("/company/invite")
-async def invite_member(req: InviteRequest):
-    try:
-        company = await db.companies.find_one({"companyId": req.companyId})
-        if not company:
-            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-        inviter = next((m for m in company.get("members", []) if m["email"] == req.inviterEmail), None)
-        if not inviter or inviter.get("role") not in ["owner", "admin"]:
-            raise HTTPException(status_code=403, detail="Nur Chef oder Admin kann einladen")
-        invitee_profile = await db.profiles.find_one({"email": req.inviteeEmail})
-        if not invitee_profile:
-            raise HTTPException(status_code=404, detail=f"Kein Konto mit Email {req.inviteeEmail} gefunden")
-        invite_id = new_id()
-        invite = {
-            "inviteId": invite_id,
-            "companyId": req.companyId,
-            "companyName": company["companyName"],
-            "inviterEmail": req.inviterEmail,
-            "inviterName": inviter.get("name", ""),
-            "inviteeEmail": req.inviteeEmail,
-            "warehouseId": req.warehouseId,
-            "warehouseName": req.warehouseName,
-            "role": req.role,
-            "status": "pending",
-            "createdAt": datetime.utcnow().isoformat(),
-        }
-        await db.invitations.insert_one(invite)
-        return {"success": True, "inviteId": invite_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.post("/company/reject")
-async def reject_invite(request: dict):
-    try:
-        invite_id = request.get("inviteId", "")
-        if not invite_id:
-            raise HTTPException(status_code=400, detail="inviteId fehlt")
-        await db.invitations.update_one(
-            {"inviteId": invite_id},
-            {"$set": {"status": "rejected"}}
-        )
-        return {"success": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.post("/company/{company_id}/leave")
-async def leave_company(company_id: str, email: str):
-    try:
-        company = await db.companies.find_one({"companyId": company_id})
-        if not company:
-            return {"success": True}
-        member = next((m for m in company.get("members", []) if m["email"] == email), None)
-        if member and member.get("role") == "owner":
-            raise HTTPException(status_code=403, detail="Chef kann die Firma nicht verlassen.")
-        await db.companies.update_one(
-            {"companyId": company_id},
-            {"$pull": {"members": {"email": email}}}
-        )
-        await db.profiles.update_one(
-            {"email": email},
-            {"$unset": {"companyId": "", "companyRole": ""}}
-        )
-        return {"success": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler")
 
 @api_router.get("/company/invites/{email}")
 async def get_invites(email: str):
+    """Ausstehende Einladungen für Email laden"""
     try:
-        invites = await db.invitations.find({
-            "inviteeEmail": email,
-            "status": "pending"
-        }).to_list(50)
+        invites = await db.invites.find({"inviteeEmail": email, "status": "pending"}).to_list(50)
         for inv in invites:
             inv.pop("_id", None)
         return invites
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler")
 
-@api_router.post("/company/accept")
-async def accept_invite(req: AcceptInviteRequest):
+@api_router.get("/company/{company_id}")
+async def get_company(company_id: str, email: str = ""):
+    """Firma per ID laden"""
     try:
-        invite = await db.invitations.find_one({"inviteId": req.inviteId})
-        if not invite:
-            raise HTTPException(status_code=404, detail="Einladung nicht gefunden")
-        if invite["inviteeEmail"] != req.userEmail:
-            raise HTTPException(status_code=403, detail="Nicht berechtigt")
-        if invite["status"] != "pending":
-            raise HTTPException(status_code=400, detail="Bereits bearbeitet")
-        company_id = invite["companyId"]
         company = await db.companies.find_one({"companyId": company_id})
-        existing = next((m for m in company.get("members", []) if m["email"] == req.userEmail), None)
-        if not existing:
-            profile = await db.profiles.find_one({"email": req.userEmail})
-            new_member = {
-                "email": req.userEmail,
-                "name": profile.get("userName", "") if profile else req.userEmail,
-                "role": invite["role"],
-                "joinedAt": datetime.utcnow().isoformat(),
-                "deviceId": req.deviceId,
-                "isActive": True,
-            }
-            await db.companies.update_one({"companyId": company_id}, {"$push": {"members": new_member}})
-        warehouse_id = invite["warehouseId"]
-        warehouses = company.get("warehouses", [])
-        wh_exists = any(w["warehouseId"] == warehouse_id for w in warehouses)
-        if not wh_exists:
-            await db.companies.update_one({"companyId": company_id}, {"$push": {"warehouses": {
-                "warehouseId": warehouse_id,
-                "warehouseName": invite["warehouseName"],
-                "warehouseIcon": "&#x1F3D7;",
-                "access": [{"email": req.userEmail, "role": invite["role"]}],
-                "materials": [], "tasks": [], "activities": [],
-                "lastSync": datetime.utcnow().isoformat(),
-                "lastSyncBy": req.userEmail,
-            }}})
-        else:
-            await db.companies.update_one(
-                {"companyId": company_id, "warehouses.warehouseId": warehouse_id},
-                {"$push": {"warehouses.$.access": {"email": req.userEmail, "role": invite["role"]}}}
-            )
-        await db.invitations.update_one({"inviteId": req.inviteId}, {"$set": {"status": "accepted"}})
-        await db.profiles.update_one(
-            {"email": req.userEmail},
-            {"$set": {"companyId": company_id, "companyRole": invite["role"]}}
-        )
-        return {"success": True, "companyId": company_id, "warehouseId": warehouse_id}
+        if not company:
+            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
+        # Access check
+        if email:
+            member_emails = [m.get("email") for m in company.get("members", [])]
+            if email not in member_emails:
+                raise HTTPException(status_code=403, detail="Kein Zugriff")
+        company.pop("_id", None)
+        return company
     except HTTPException:
         raise
     except Exception as e:
         logging.error(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Fehler")
 
-@api_router.post("/company/role")
-async def change_role(req: GrantRoleRequest):
+@api_router.post("/company/invite")
+async def invite_member(req: InviteRequest):
+    """Mitglied einladen"""
     try:
         company = await db.companies.find_one({"companyId": req.companyId})
         if not company:
             raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-        owner = next((m for m in company.get("members", []) if m["email"] == req.ownerEmail), None)
-        if not owner or owner.get("role") not in ["owner", "admin"]:
-            raise HTTPException(status_code=403, detail="Nur Chef oder Admin")
+        # Check permissions
+        members = company.get("members", [])
+        inviter = next((m for m in members if m["email"] == req.inviterEmail), None)
+        if not inviter or inviter["role"] not in ("owner", "admin"):
+            raise HTTPException(status_code=403, detail="Keine Berechtigung")
+        # Check if already member
+        if any(m["email"] == req.inviteeEmail for m in members):
+            raise HTTPException(status_code=400, detail="Bereits Mitglied")
+        # Check for existing pending invite
+        existing_invite = await db.invites.find_one({
+            "companyId": req.companyId,
+            "inviteeEmail": req.inviteeEmail,
+            "status": "pending"
+        })
+        if existing_invite:
+            existing_invite.pop("_id", None)
+            return {"success": True, "invite": existing_invite}
+        invite_id = str(uuid.uuid4())
+        invite = {
+            "inviteId": invite_id,
+            "companyId": req.companyId,
+            "companyName": company.get("companyName", ""),
+            "inviterEmail": req.inviterEmail,
+            "inviteeEmail": req.inviteeEmail,
+            "role": req.role,
+            "status": "pending",
+            "createdAt": datetime.utcnow().isoformat(),
+        }
+        await db.invites.insert_one(invite)
+        invite.pop("_id", None)
+        return {"success": True, "invite": invite}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Einladung fehlgeschlagen")
+
+@api_router.post("/company/accept")
+async def accept_invite(req: AcceptInviteRequest):
+    """Einladung annehmen"""
+    try:
+        invite = await db.invites.find_one({"inviteId": req.inviteId, "inviteeEmail": req.email})
+        if not invite:
+            raise HTTPException(status_code=404, detail="Einladung nicht gefunden")
+        if invite.get("status") != "pending":
+            raise HTTPException(status_code=400, detail="Einladung bereits bearbeitet")
+        # Add member to company
+        new_member = {
+            "email": req.email,
+            "name": req.userName or req.email.split("@")[0],
+            "role": invite.get("role", "member"),
+            "deviceId": req.deviceId,
+            "joinedAt": datetime.utcnow().isoformat(),
+        }
+        await db.companies.update_one(
+            {"companyId": invite["companyId"]},
+            {"$push": {"members": new_member}}
+        )
+        await db.invites.update_one({"inviteId": req.inviteId}, {"$set": {"status": "accepted"}})
+        company = await db.companies.find_one({"companyId": invite["companyId"]})
+        company.pop("_id", None)
+        # Notify company members via WebSocket
+        await broadcast_company_update(invite["companyId"], {"type": "member_joined", "email": req.email})
+        return {"success": True, "company": company}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler beim Annehmen")
+
+@api_router.post("/company/reject")
+async def reject_invite(req: RejectInviteRequest):
+    """Einladung ablehnen"""
+    try:
+        await db.invites.update_one(
+            {"inviteId": req.inviteId, "inviteeEmail": req.email},
+            {"$set": {"status": "rejected"}}
+        )
+        return {"success": True}
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler")
+
+@api_router.post("/company/role")
+async def change_role(req: ChangeRoleRequest):
+    """Rolle eines Mitglieds ändern"""
+    try:
+        company = await db.companies.find_one({"companyId": req.companyId})
+        if not company:
+            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
+        if company.get("ownerEmail") != req.ownerEmail:
+            owner_member = next((m for m in company.get("members", []) if m["email"] == req.ownerEmail), None)
+            if not owner_member or owner_member["role"] not in ("owner", "admin"):
+                raise HTTPException(status_code=403, detail="Keine Berechtigung")
+        if req.newRole == "owner":
+            raise HTTPException(status_code=400, detail="Owner kann nicht geändert werden")
         await db.companies.update_one(
             {"companyId": req.companyId, "members.email": req.targetEmail},
             {"$set": {"members.$.role": req.newRole}}
         )
-        await db.profiles.update_one(
-            {"email": req.targetEmail},
-            {"$set": {"companyRole": req.newRole}}
-        )
+        await broadcast_company_update(req.companyId, {"type": "role_changed", "email": req.targetEmail, "role": req.newRole})
         return {"success": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.delete("/company/{company_id}/member/{email}")
-async def remove_member(company_id: str, email: str, owner_email: str):
-    try:
-        company = await db.companies.find_one({"companyId": company_id})
-        if not company:
-            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-        owner = next((m for m in company.get("members", []) if m["email"] == owner_email), None)
-        if not owner or owner.get("role") not in ["owner", "admin"]:
-            raise HTTPException(status_code=403, detail="Nur Chef oder Admin")
-        await db.companies.update_one({"companyId": company_id}, {"$pull": {"members": {"email": email}}})
-        await db.profiles.update_one({"email": email}, {"$unset": {"companyId": "", "companyRole": ""}})
-        return {"success": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ─── LAGER SYNC ───────────────────────────────────────────────
-
-@api_router.post("/company/warehouse/sync")
-async def sync_warehouse(req: WarehouseSyncRequest):
-    try:
-        company = await db.companies.find_one({"companyId": req.companyId})
-        if not company:
-            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-        warehouses = company.get("warehouses", [])
-        wh = next((w for w in warehouses if w["warehouseId"] == req.warehouseId), None)
-        if not wh:
-            raise HTTPException(status_code=404, detail="Lager nicht gefunden")
-        member = next((m for m in company.get("members", []) if m["email"] == req.userEmail), None)
-        access = next((a for a in wh.get("access", []) if a["email"] == req.userEmail), None)
-        if not access and not (member and member.get("role") in ["owner", "admin"]):
-            raise HTTPException(status_code=403, detail="Kein Zugriff")
-        if access and access.get("role") == "readonly":
-            raise HTTPException(status_code=403, detail="Nur Lesezugriff")
-        now = datetime.utcnow().isoformat()
-        await db.companies.update_one(
-            {"companyId": req.companyId, "warehouses.warehouseId": req.warehouseId},
-            {"$set": {
-                "warehouses.$.materials": req.materials,
-                "warehouses.$.tasks": req.tasks,
-                "warehouses.$.activities": req.activities,
-                "warehouses.$.lastSync": now,
-                "warehouses.$.lastSyncBy": req.userEmail,
-            }}
-        )
-        await manager.broadcast(req.warehouseId, {
-            "type": "warehouse_updated",
-            "warehouseId": req.warehouseId,
-            "updatedBy": req.userEmail,
-            "materials": req.materials,
-            "tasks": req.tasks,
-            "activities": req.activities,
-            "syncedAt": now,
-        })
-        return {"success": True, "syncedAt": now}
     except HTTPException:
         raise
     except Exception as e:
         logging.error(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Fehler")
 
-@api_router.get("/company/{company_id}/warehouse/{warehouse_id}")
-async def get_warehouse(company_id: str, warehouse_id: str, email: str):
+@api_router.post("/company/{company_id}/leave")
+async def leave_company(company_id: str, email: str):
+    """Firma verlassen"""
     try:
         company = await db.companies.find_one({"companyId": company_id})
         if not company:
             raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-        wh = next((w for w in company.get("warehouses", []) if w["warehouseId"] == warehouse_id), None)
-        if not wh:
-            raise HTTPException(status_code=404, detail="Lager nicht gefunden")
-        member = next((m for m in company.get("members", []) if m["email"] == email), None)
-        access = next((a for a in wh.get("access", []) if a["email"] == email), None)
-        if not access and not (member and member.get("role") in ["owner", "admin"]):
-            raise HTTPException(status_code=403, detail="Kein Zugriff")
-        return {
-            "warehouseId": wh["warehouseId"],
-            "warehouseName": wh.get("warehouseName", ""),
-            "warehouseIcon": wh.get("warehouseIcon", "&#x1F3D7;"),
-            "materials": wh.get("materials", []),
-            "tasks": wh.get("tasks", []),
-            "activities": wh.get("activities", []),
-            "lastSync": wh.get("lastSync", ""),
-            "lastSyncBy": wh.get("lastSyncBy", ""),
-            "access": wh.get("access", []),
-            "userRole": access.get("role", "member") if access else member.get("role", "owner"),
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.post("/company/{company_id}/warehouse/create")
-async def create_warehouse(company_id: str, email: str, name: str, icon: str = "&#x1F3D7;"):
-    try:
-        company = await db.companies.find_one({"companyId": company_id})
-        if not company:
-            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-        member = next((m for m in company.get("members", []) if m["email"] == email), None)
-        if not member or member.get("role") not in ["owner", "admin"]:
-            raise HTTPException(status_code=403, detail="Nur Chef oder Admin")
-        wh_id = new_id()
-        warehouse = {
-            "warehouseId": wh_id,
-            "warehouseName": name,
-            "warehouseIcon": icon,
-            "access": [{"email": email, "role": "owner"}],
-            "materials": [], "tasks": [], "activities": [],
-            "lastSync": datetime.utcnow().isoformat(),
-            "lastSyncBy": email,
-        }
-        await db.companies.update_one({"companyId": company_id}, {"$push": {"warehouses": warehouse}})
-        return {"success": True, "warehouseId": wh_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.delete("/company/{company_id}/warehouse/{warehouse_id}")
-async def delete_warehouse(company_id: str, warehouse_id: str, email: str):
-    try:
-        company = await db.companies.find_one({"companyId": company_id})
-        if not company:
-            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-        member = next((m for m in company.get("members", []) if m["email"] == email), None)
-        if not member or member.get("role") not in ["owner", "admin"]:
-            raise HTTPException(status_code=403, detail="Nur Chef oder Admin")
+        if company.get("ownerEmail") == email:
+            raise HTTPException(status_code=400, detail="Owner kann Firma nicht verlassen — Firma löschen")
         await db.companies.update_one(
             {"companyId": company_id},
-            {"$pull": {"warehouses": {"warehouseId": warehouse_id}}}
+            {"$pull": {"members": {"email": email}}}
         )
+        await broadcast_company_update(company_id, {"type": "member_left", "email": email})
         return {"success": True}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler")
 
-# ─── AI CHAT ──────────────────────────────────────────────────
-
-@api_router.post("/chat", response_model=ChatResponse)
-async def chat_with_ai(request: ChatRequest):
-    system_message = "Du bist ein KI-Assistent fuer eine Materiallager App fuer Elektriker. Antworte auf Deutsch, klar und verstaendlich."
+@api_router.delete("/company/{company_id}/member/{member_email}")
+async def remove_member(company_id: str, member_email: str, owner_email: str = ""):
+    """Mitglied entfernen"""
     try:
-        completion = await ai_client.chat.completions.create(
-            model="gpt-4o-mini", max_tokens=300, temperature=0.3,
-            messages=[{"role": "system", "content": system_message}, {"role": "user", "content": request.message}],
+        company = await db.companies.find_one({"companyId": company_id})
+        if not company:
+            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
+        if owner_email:
+            owner = next((m for m in company.get("members", []) if m["email"] == owner_email), None)
+            if not owner or owner["role"] not in ("owner", "admin"):
+                raise HTTPException(status_code=403, detail="Keine Berechtigung")
+        await db.companies.update_one(
+            {"companyId": company_id},
+            {"$pull": {"members": {"email": member_email}}}
         )
-        return ChatResponse(response=completion.choices[0].message.content, actions_taken=[])
+        await broadcast_company_update(company_id, {"type": "member_removed", "email": member_email})
+        return {"success": True}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail="KI Fehler")
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler")
 
-# ─── WEBSOCKET ────────────────────────────────────────────────
+# -----------------------------
+# LAGER (WAREHOUSE)
+# -----------------------------
 
-@app.websocket("/ws/warehouse/{warehouse_id}")
-async def websocket_warehouse(ws: WebSocket, warehouse_id: str, email: str = "", name: str = ""):
-    user_info = {"email": email, "name": name or email}
-    await manager.connect(ws, warehouse_id, user_info)
+@api_router.post("/company/{company_id}/warehouse/create")
+async def create_warehouse(company_id: str, email: str, name: str, icon: str = "🏭"):
+    """Lager erstellen"""
+    try:
+        company = await db.companies.find_one({"companyId": company_id})
+        if not company:
+            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
+        member = next((m for m in company.get("members", []) if m["email"] == email), None)
+        if not member or member["role"] not in ("owner", "admin"):
+            raise HTTPException(status_code=403, detail="Keine Berechtigung")
+        warehouse_id = str(uuid.uuid4())
+        warehouse = {
+            "warehouseId": warehouse_id,
+            "name": name,
+            "icon": icon,
+            "createdAt": datetime.utcnow().isoformat(),
+            "createdBy": email,
+        }
+        await db.companies.update_one(
+            {"companyId": company_id},
+            {"$push": {"warehouses": warehouse}}
+        )
+        await broadcast_company_update(company_id, {"type": "warehouse_created", "warehouse": warehouse})
+        return {"success": True, "warehouse": warehouse}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler")
+
+@api_router.get("/company/{company_id}/warehouse/{warehouse_id}")
+async def get_warehouse(company_id: str, warehouse_id: str, email: str = ""):
+    """Lager-Materialien laden"""
+    try:
+        if email:
+            company = await db.companies.find_one({"companyId": company_id})
+            if company:
+                member_emails = [m.get("email") for m in company.get("members", [])]
+                if email not in member_emails:
+                    raise HTTPException(status_code=403, detail="Kein Zugriff")
+        sync_data = await db.warehouse_materials.find_one({
+            "companyId": company_id, "warehouseId": warehouse_id
+        })
+        if not sync_data:
+            return {"materials": [], "syncedAt": ""}
+        sync_data.pop("_id", None)
+        return sync_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler")
+
+@api_router.post("/company/warehouse/sync")
+async def sync_warehouse(req: WarehouseSyncRequest):
+    """Lager-Materialien synchronisieren"""
+    try:
+        company = await db.companies.find_one({"companyId": req.companyId})
+        if not company:
+            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
+        member = next((m for m in company.get("members", []) if m["email"] == req.email), None)
+        if not member:
+            raise HTTPException(status_code=403, detail="Kein Zugriff")
+        data = {
+            "companyId": req.companyId,
+            "warehouseId": req.warehouseId,
+            "materials": req.materials,
+            "syncedAt": req.syncedAt or datetime.utcnow().isoformat(),
+            "syncedBy": req.email,
+        }
+        await db.warehouse_materials.update_one(
+            {"companyId": req.companyId, "warehouseId": req.warehouseId},
+            {"$set": data}, upsert=True
+        )
+        await broadcast_company_update(req.companyId, {
+            "type": "warehouse_synced",
+            "warehouseId": req.warehouseId,
+            "by": req.email,
+            "count": len(req.materials),
+        })
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Sync fehlgeschlagen")
+
+# -----------------------------
+# WEBSOCKET (Echtzeit-Sync)
+# -----------------------------
+
+async def broadcast_company_update(company_id: str, message: dict):
+    """Alle Verbindungen in einer Firma benachrichtigen"""
+    connections = company_connections.get(company_id, [])
+    disconnected = []
+    for ws in connections:
+        try:
+            await ws.send_text(json.dumps(message))
+        except Exception:
+            disconnected.append(ws)
+    for ws in disconnected:
+        connections.remove(ws)
+
+@app.websocket("/ws/company/{company_id}")
+async def websocket_company(websocket: WebSocket, company_id: str):
+    await websocket.accept()
+    if company_id not in company_connections:
+        company_connections[company_id] = []
+    company_connections[company_id].append(websocket)
     try:
         while True:
-            data = await ws.receive_json()
-            msg_type = data.get("type", "")
-            if msg_type == "ping":
-                await ws.send_json({"type": "pong"})
-            elif msg_type == "material_change":
-                await manager.broadcast(warehouse_id, {
-                    "type": "material_change",
-                    "materialId": data.get("materialId"),
-                    "qty": data.get("qty"),
-                    "changedBy": email,
-                    "changedByName": name,
-                    "timestamp": datetime.utcnow().isoformat(),
-                }, exclude=ws)
-            elif msg_type == "task_change":
-                await manager.broadcast(warehouse_id, {
-                    "type": "task_change",
-                    "taskId": data.get("taskId"),
-                    "status": data.get("status"),
-                    "changedBy": email,
-                }, exclude=ws)
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+                # Broadcast to all other members
+                await broadcast_company_update(company_id, msg)
+            except Exception:
+                pass
     except WebSocketDisconnect:
-        room = manager.disconnect(ws)
-        if room:
-            await manager.broadcast(room, {"type": "user_left", "email": email, "name": name})
-            await manager.broadcast_active_users(room)
+        if company_id in company_connections:
+            try:
+                company_connections[company_id].remove(websocket)
+            except ValueError:
+                pass
 
-# ─── ROUTER ───────────────────────────────────────────────────
+# -----------------------------
+# ROUTER + MIDDLEWARE
+# -----------------------------
 
 app.include_router(api_router)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -----------------------------
+# SHUTDOWN
+# -----------------------------
 
 @app.on_event("shutdown")
-async def shutdown():
+async def shutdown_db_client():
     client.close()
+
+# -----------------------------
+# START SERVER (Render)
+# -----------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
