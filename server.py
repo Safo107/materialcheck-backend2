@@ -10,12 +10,14 @@ import hashlib
 import json
 import re
 import uuid
-import asyncio
+import random
+import string
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any, Dict
-from datetime import datetime
+from datetime import datetime, timedelta
 import uvicorn
+import httpx
 
 # -----------------------------
 # ENV LOAD
@@ -52,6 +54,43 @@ api_router = APIRouter(prefix="/api")
 
 def hash_pin(pin: str) -> str:
     return hashlib.sha256(pin.encode()).hexdigest()
+
+def norm_email(email: str) -> str:
+    return email.strip().lower()
+
+def gen_code(length: int = 6) -> str:
+    return "".join(random.choices(string.digits, k=length))
+
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+
+async def send_reset_email(to_email: str, code: str) -> bool:
+    if not RESEND_API_KEY:
+        logging.warning(f"RESEND_API_KEY not set — PIN reset code for {to_email}: {code}")
+        return True  # In dev mode, pretend it was sent
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "from": "MaterialCheck <noreply@elektrogenius.de>",
+                    "to": [to_email],
+                    "subject": "MaterialCheck — PIN zurücksetzen",
+                    "html": f"""
+                    <div style="font-family:sans-serif;max-width:400px;margin:auto;padding:24px">
+                    <h2 style="color:#f5a623">MaterialCheck PIN Reset</h2>
+                    <p>Dein Reset-Code:</p>
+                    <div style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#0d1117;background:#f5a623;padding:16px;border-radius:8px;text-align:center">{code}</div>
+                    <p style="color:#666;font-size:12px">Der Code ist 15 Minuten gültig. Falls du keinen Reset angefordert hast, ignoriere diese Email.</p>
+                    </div>
+                    """,
+                },
+                timeout=10,
+            )
+            return res.status_code < 300
+    except Exception as e:
+        logging.error(f"Email send error: {e}")
+        return False
 
 # WebSocket connections: { companyId: [ws, ws, ...] }
 company_connections: Dict[str, List[WebSocket]] = {}
@@ -152,6 +191,15 @@ class WarehouseSyncRequest(BaseModel):
     email: str
     materials: List[Any] = []
     syncedAt: str = ""
+
+class PinResetRequestModel(BaseModel):
+    email: str
+
+class PinResetConfirmModel(BaseModel):
+    email: str
+    code: str
+    newPin: str
+    deviceId: str
 
 # -----------------------------
 # ROOT
@@ -264,6 +312,8 @@ async def save_profile(profile: ProfileModel):
     """Profil speichern — PIN wird gehashed wenn mitgeliefert"""
     try:
         data = profile.model_dump()
+        if data.get("email"):
+            data["email"] = norm_email(data["email"])
         # Hash PIN if provided in plaintext (6 chars or less = plain)
         if data.get("pin") and len(data["pin"]) <= 6:
             data["pin"] = hash_pin(data["pin"])
@@ -281,8 +331,7 @@ async def save_profile(profile: ProfileModel):
             {"$set": data},
             upsert=True
         )
-        # If email changed, update old email record too
-        if existing and existing.get("email") != data.get("email") and data.get("email"):
+        if data.get("email"):
             await db.profiles.update_one({"email": data["email"]}, {"$set": data}, upsert=True)
         return {"success": True}
     except Exception as e:
@@ -293,7 +342,7 @@ async def save_profile(profile: ProfileModel):
 async def check_profile_by_email(email: str):
     """Prüfen ob Profil mit dieser Email existiert"""
     try:
-        profile = await db.profiles.find_one({"email": email})
+        profile = await db.profiles.find_one({"email": norm_email(email)})
         if not profile:
             raise HTTPException(status_code=404, detail="Kein Profil gefunden")
         profile.pop("_id", None)
@@ -313,7 +362,7 @@ async def check_profile_by_email(email: str):
 async def load_profile_with_pin(req: ProfileLoadRequest):
     """Profil mit Email + PIN laden"""
     try:
-        profile = await db.profiles.find_one({"email": req.email})
+        profile = await db.profiles.find_one({"email": norm_email(req.email)})
         if not profile:
             raise HTTPException(status_code=404, detail="Kein Profil gefunden")
         stored_pin = profile.get("pin")
@@ -351,6 +400,63 @@ async def get_profile(device_id: str):
         raise HTTPException(status_code=500, detail="Profil konnte nicht geladen werden")
 
 # -----------------------------
+# PIN RESET
+# -----------------------------
+
+@api_router.post("/profile/reset-pin/request")
+async def reset_pin_request(req: PinResetRequestModel):
+    """Reset-Code per Email senden"""
+    try:
+        email = norm_email(req.email)
+        profile = await db.profiles.find_one({"email": email})
+        if not profile:
+            raise HTTPException(status_code=404, detail="Kein Profil gefunden")
+        code = gen_code(6)
+        expires = (datetime.utcnow() + timedelta(minutes=15)).isoformat()
+        await db.pin_resets.update_one(
+            {"email": email},
+            {"$set": {"email": email, "code": code, "expires": expires, "used": False}},
+            upsert=True
+        )
+        ok = await send_reset_email(email, code)
+        if not ok:
+            raise HTTPException(status_code=500, detail="Email konnte nicht gesendet werden")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler")
+
+@api_router.post("/profile/reset-pin/confirm")
+async def reset_pin_confirm(req: PinResetConfirmModel):
+    """PIN mit Code zurücksetzen"""
+    try:
+        email = norm_email(req.email)
+        reset = await db.pin_resets.find_one({"email": email, "used": False})
+        if not reset:
+            raise HTTPException(status_code=400, detail="Kein aktiver Reset-Code")
+        if reset.get("code") != req.code:
+            raise HTTPException(status_code=401, detail="Falscher Code")
+        if datetime.fromisoformat(reset["expires"]) < datetime.utcnow():
+            raise HTTPException(status_code=400, detail="Code abgelaufen")
+        new_pin_hash = hash_pin(req.newPin)
+        await db.profiles.update_one(
+            {"email": email},
+            {"$set": {"pin": new_pin_hash, "hasPin": True, "deviceId": req.deviceId}}
+        )
+        await db.pin_resets.update_one({"email": email}, {"$set": {"used": True}})
+        profile = await db.profiles.find_one({"email": email})
+        profile.pop("_id", None)
+        profile.pop("pin", None)
+        return {"success": True, "profile": profile}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler")
+
+# -----------------------------
 # MATERIALIEN SYNC
 # -----------------------------
 
@@ -360,7 +466,7 @@ async def sync_materials(req: MaterialsSyncRequest):
     try:
         data = {
             "deviceId": req.deviceId,
-            "email": req.email,
+            "email": norm_email(req.email) if req.email else req.email,
             "folders": req.folders,
             "materials": req.materials,
             "tasks": req.tasks,
