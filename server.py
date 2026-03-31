@@ -747,6 +747,68 @@ async def remove_member(company_id: str, member_email: str, owner_email: str = "
         logging.error(e)
         raise HTTPException(status_code=500, detail="Fehler")
 
+@api_router.delete("/company/{company_id}")
+async def dissolve_company(company_id: str, owner_email: str = ""):
+    """Firma auflösen: Transfer an besten Kandidaten ODER komplett löschen wenn Solo"""
+    try:
+        company = await db.companies.find_one({"companyId": company_id})
+        if not company:
+            raise HTTPException(status_code=404, detail="Firma nicht gefunden")
+
+        # Nur Owner darf auflösen
+        owner_email_norm = norm_email(owner_email)
+        if norm_email(company.get("ownerEmail","")) != owner_email_norm:
+            raise HTTPException(status_code=403, detail="Nur der Chef kann die Firma auflösen")
+
+        members = company.get("members", [])
+        other_members = [m for m in members if norm_email(m.get("email","")) != owner_email_norm]
+
+        if not other_members:
+            # Solo-Chef → komplett löschen
+            await db.companies.delete_one({"companyId": company_id})
+            return {"success": True, "action": "deleted", "newOwner": None}
+
+        # Anderen Chef finden: Admin zuerst, dann Member — jeweils älteste joinedAt
+        def sort_key(m):
+            return m.get("joinedAt", "2099-01-01")
+
+        admins  = sorted([m for m in other_members if m.get("role") == "admin"],  key=sort_key)
+        members_only = sorted([m for m in other_members if m.get("role") not in ("owner","admin")], key=sort_key)
+
+        new_owner_member = admins[0] if admins else (members_only[0] if members_only else None)
+
+        if not new_owner_member:
+            # Keine anderen Mitglieder mehr → löschen
+            await db.companies.delete_one({"companyId": company_id})
+            return {"success": True, "action": "deleted", "newOwner": None}
+
+        new_owner_email = new_owner_member["email"]
+
+        # Neuen Owner setzen, alten Owner entfernen
+        await db.companies.update_one(
+            {"companyId": company_id},
+            {
+                "$set": {
+                    "ownerEmail": new_owner_email,
+                    "members.$[newowner].role": "owner",
+                },
+                "$pull": {"members": {"email": owner_email_norm}},
+            },
+            array_filters=[{"newowner.email": new_owner_email}]
+        )
+
+        await broadcast_company_update(company_id, {
+            "type": "ownership_transferred",
+            "newOwner": new_owner_email,
+            "previousOwner": owner_email_norm,
+        })
+        return {"success": True, "action": "transferred", "newOwner": new_owner_email}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Fehler beim Auflösen")
+
 # -----------------------------
 # LAGER (WAREHOUSE)
 # -----------------------------
