@@ -95,6 +95,9 @@ async def send_reset_email(to_email: str, code: str) -> bool:
 # WebSocket connections: { companyId: [ws, ws, ...] }
 company_connections: Dict[str, List[WebSocket]] = {}
 
+# WebSocket connections pro Lager: { warehouseId: [{ws, email, name}, ...] }
+warehouse_connections: Dict[str, List[dict]] = {}
+
 # -----------------------------
 # MODELS
 # -----------------------------
@@ -190,6 +193,8 @@ class WarehouseSyncRequest(BaseModel):
     warehouseId: str
     email: str
     materials: List[Any] = []
+    tasks: List[Any] = []
+    activities: List[Any] = []
     syncedAt: str = ""
 
 class PinResetRequestModel(BaseModel):
@@ -889,7 +894,7 @@ async def get_warehouse(company_id: str, warehouse_id: str, email: str = ""):
             "companyId": company_id, "warehouseId": warehouse_id
         })
         if not sync_data:
-            return {"materials": [], "syncedAt": ""}
+            return {"materials": [], "tasks": [], "activities": [], "syncedAt": ""}
         sync_data.pop("_id", None)
         return sync_data
     except HTTPException:
@@ -912,6 +917,8 @@ async def sync_warehouse(req: WarehouseSyncRequest):
             "companyId": req.companyId,
             "warehouseId": req.warehouseId,
             "materials": req.materials,
+            "tasks": req.tasks,
+            "activities": req.activities,
             "syncedAt": req.syncedAt or datetime.utcnow().isoformat(),
             "syncedBy": req.email,
         }
@@ -919,11 +926,12 @@ async def sync_warehouse(req: WarehouseSyncRequest):
             {"companyId": req.companyId, "warehouseId": req.warehouseId},
             {"$set": data}, upsert=True
         )
-        await broadcast_company_update(req.companyId, {
-            "type": "warehouse_synced",
-            "warehouseId": req.warehouseId,
-            "by": req.email,
-            "count": len(req.materials),
+        await broadcast_warehouse_update(req.warehouseId, {
+            "type": "warehouse_updated",
+            "materials": req.materials,
+            "tasks": req.tasks,
+            "activities": req.activities,
+            "updatedBy": req.email,
         })
         return {"success": True}
     except HTTPException:
@@ -947,6 +955,62 @@ async def broadcast_company_update(company_id: str, message: dict):
             disconnected.append(ws)
     for ws in disconnected:
         connections.remove(ws)
+
+async def broadcast_warehouse_update(warehouse_id: str, message: dict, exclude: WebSocket = None):
+    """Alle Verbindungen in einem Lager benachrichtigen"""
+    users = warehouse_connections.get(warehouse_id, [])
+    disconnected = []
+    for u in users:
+        if u["ws"] == exclude:
+            continue
+        try:
+            await u["ws"].send_text(json.dumps(message))
+        except Exception:
+            disconnected.append(u)
+    for u in disconnected:
+        if u in users:
+            users.remove(u)
+
+async def broadcast_active_users(warehouse_id: str):
+    users = warehouse_connections.get(warehouse_id, [])
+    active = [{"email": u["email"], "name": u["name"]} for u in users]
+    msg = json.dumps({"type": "active_users", "users": active})
+    disconnected = []
+    for u in users:
+        try:
+            await u["ws"].send_text(msg)
+        except Exception:
+            disconnected.append(u)
+    for u in disconnected:
+        if u in users:
+            users.remove(u)
+
+@app.websocket("/ws/warehouse/{warehouse_id}")
+async def websocket_warehouse(websocket: WebSocket, warehouse_id: str, email: str = "", name: str = ""):
+    await websocket.accept()
+    if warehouse_id not in warehouse_connections:
+        warehouse_connections[warehouse_id] = []
+    user_info = {"ws": websocket, "email": email, "name": name or email}
+    warehouse_connections[warehouse_id].append(user_info)
+    await broadcast_active_users(warehouse_id)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+                if msg.get("type") == "ping":
+                    continue
+                msg["changedBy"] = email
+                msg["changedByName"] = name or email
+                await broadcast_warehouse_update(warehouse_id, msg, exclude=websocket)
+            except (json.JSONDecodeError, ValueError):
+                pass
+    except WebSocketDisconnect:
+        if warehouse_id in warehouse_connections:
+            warehouse_connections[warehouse_id] = [
+                u for u in warehouse_connections[warehouse_id] if u["ws"] != websocket
+            ]
+        await broadcast_active_users(warehouse_id)
 
 @app.websocket("/ws/company/{company_id}")
 async def websocket_company(websocket: WebSocket, company_id: str):
