@@ -280,7 +280,10 @@ Wenn du eine Aktion ausführen willst, antworte im JSON Format:
         final_response = response
         json_match = re.search(r"\{.*\}", response, re.DOTALL)
         if json_match:
-            action_data = json.loads(json_match.group(0))
+            try:
+                action_data = json.loads(json_match.group(0))
+            except json.JSONDecodeError:
+                action_data = {}
             action = action_data.get("action")
             data = action_data.get("data", {})
             message = action_data.get("message", response)
@@ -929,7 +932,7 @@ async def websocket_company(websocket: WebSocket, company_id: str):
                 msg = json.loads(data)
                 # Broadcast to all other members
                 await broadcast_company_update(company_id, msg)
-            except Exception:
+            except (json.JSONDecodeError, ValueError):
                 pass
     except WebSocketDisconnect:
         if company_id in company_connections:
@@ -997,44 +1000,52 @@ async def create_checkout_session(body: CheckoutSessionRequest):
 async def stripe_webhook(req: Request):
     if not _stripe_available or not stripe_lib:
         raise HTTPException(status_code=503, detail="Stripe nicht konfiguriert")
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="STRIPE_WEBHOOK_SECRET nicht gesetzt")
 
-    body = await req.body()
+    body = (await req.body()).decode("utf-8")
     sig = req.headers.get("stripe-signature", "")
 
     try:
         event = stripe_lib.Webhook.construct_event(body, sig, STRIPE_WEBHOOK_SECRET)
     except stripe_lib.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Webhook Signatur ungültig")
+    except Exception as e:
+        logging.error(f"Webhook Fehler: {e}")
+        raise HTTPException(status_code=400, detail="Webhook konnte nicht verarbeitet werden")
 
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        email = session.get("metadata", {}).get("email")
-        if email:
-            await db.profiles.update_one(
-                {"email": norm_email(email)},
-                {"$set": {"isPremium": True, "premiumSince": datetime.utcnow()}},
-            )
-            logging.info(f"✅ MaterialCheck+ aktiviert für {email}")
+    try:
+        if event["type"] == "checkout.session.completed":
+            session = event["data"]["object"]
+            email = session.get("metadata", {}).get("email")
+            if email:
+                await db.profiles.update_one(
+                    {"email": norm_email(email)},
+                    {"$set": {"isPremium": True, "premiumSince": datetime.utcnow()}},
+                )
+                logging.info(f"✅ MaterialCheck+ aktiviert für {email}")
 
-    elif event["type"] == "customer.subscription.deleted":
-        subscription = event["data"]["object"]
-        email = subscription.get("metadata", {}).get("email")
-        if email:
-            await db.profiles.update_one(
-                {"email": norm_email(email)},
-                {"$set": {"isPremium": False}},
-            )
-            logging.info(f"❌ MaterialCheck+ deaktiviert für {email}")
+        elif event["type"] == "customer.subscription.deleted":
+            subscription = event["data"]["object"]
+            email = subscription.get("metadata", {}).get("email")
+            if email:
+                await db.profiles.update_one(
+                    {"email": norm_email(email)},
+                    {"$set": {"isPremium": False}},
+                )
+                logging.info(f"❌ MaterialCheck+ deaktiviert für {email}")
 
-    elif event["type"] == "customer.subscription.updated":
-        subscription = event["data"]["object"]
-        email = subscription.get("metadata", {}).get("email")
-        is_active = subscription.get("status") == "active"
-        if email:
-            await db.profiles.update_one(
-                {"email": norm_email(email)},
-                {"$set": {"isPremium": is_active}},
-            )
+        elif event["type"] == "customer.subscription.updated":
+            subscription = event["data"]["object"]
+            email = subscription.get("metadata", {}).get("email")
+            is_active = subscription.get("status") == "active"
+            if email:
+                await db.profiles.update_one(
+                    {"email": norm_email(email)},
+                    {"$set": {"isPremium": is_active}},
+                )
+    except Exception as e:
+        logging.error(f"Webhook Verarbeitung Fehler: {e}")
 
     return {"received": True}
 
