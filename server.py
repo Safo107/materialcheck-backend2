@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Request
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -937,6 +937,107 @@ async def websocket_company(websocket: WebSocket, company_id: str):
                 company_connections[company_id].remove(websocket)
             except ValueError:
                 pass
+
+# -----------------------------
+# STRIPE
+# -----------------------------
+
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "")
+
+try:
+    import stripe as stripe_lib
+    stripe_lib.api_key = STRIPE_SECRET_KEY if STRIPE_SECRET_KEY else None
+    _stripe_available = bool(STRIPE_SECRET_KEY)
+except ImportError:
+    stripe_lib = None  # type: ignore
+    _stripe_available = False
+
+
+class CheckoutSessionRequest(BaseModel):
+    email: str
+    deviceId: str
+
+
+@api_router.post("/stripe/create-checkout-session")
+async def create_checkout_session(body: CheckoutSessionRequest):
+    if not _stripe_available or not stripe_lib:
+        raise HTTPException(status_code=503, detail="Stripe nicht konfiguriert")
+    if not STRIPE_PRICE_ID:
+        raise HTTPException(status_code=503, detail="STRIPE_PRICE_ID fehlt")
+
+    profile = await db.profiles.find_one({"email": norm_email(body.email)})
+    customer_id = profile.get("stripeCustomerId") if profile else None
+
+    if not customer_id:
+        customer = stripe_lib.Customer.create(
+            email=body.email,
+            metadata={"email": body.email, "deviceId": body.deviceId},
+        )
+        customer_id = customer.id
+        await db.profiles.update_one(
+            {"email": norm_email(body.email)},
+            {"$set": {"stripeCustomerId": customer_id}},
+        )
+
+    session = stripe_lib.checkout.Session.create(
+        customer=customer_id,
+        payment_method_types=["card"],
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        mode="subscription",
+        metadata={"email": body.email, "deviceId": body.deviceId},
+        success_url="https://materialcheck.elektrogenius.de/success",
+        cancel_url="https://materialcheck.elektrogenius.de/cancel",
+    )
+    return {"url": session.url}
+
+
+@api_router.post("/stripe/webhook")
+async def stripe_webhook(req: Request):
+    if not _stripe_available or not stripe_lib:
+        raise HTTPException(status_code=503, detail="Stripe nicht konfiguriert")
+
+    body = await req.body()
+    sig = req.headers.get("stripe-signature", "")
+
+    try:
+        event = stripe_lib.Webhook.construct_event(body, sig, STRIPE_WEBHOOK_SECRET)
+    except stripe_lib.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Webhook Signatur ungültig")
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        email = session.get("metadata", {}).get("email")
+        if email:
+            await db.profiles.update_one(
+                {"email": norm_email(email)},
+                {"$set": {"isPremium": True, "premiumSince": datetime.utcnow()}},
+            )
+            logging.info(f"✅ MaterialCheck+ aktiviert für {email}")
+
+    elif event["type"] == "customer.subscription.deleted":
+        subscription = event["data"]["object"]
+        email = subscription.get("metadata", {}).get("email")
+        if email:
+            await db.profiles.update_one(
+                {"email": norm_email(email)},
+                {"$set": {"isPremium": False}},
+            )
+            logging.info(f"❌ MaterialCheck+ deaktiviert für {email}")
+
+    elif event["type"] == "customer.subscription.updated":
+        subscription = event["data"]["object"]
+        email = subscription.get("metadata", {}).get("email")
+        is_active = subscription.get("status") == "active"
+        if email:
+            await db.profiles.update_one(
+                {"email": norm_email(email)},
+                {"$set": {"isPremium": is_active}},
+            )
+
+    return {"received": True}
+
 
 # -----------------------------
 # ROUTER + MIDDLEWARE
