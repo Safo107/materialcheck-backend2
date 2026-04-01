@@ -465,25 +465,54 @@ async def reset_pin_confirm(req: PinResetConfirmModel):
 
 @api_router.post("/materials/sync")
 async def sync_materials(req: MaterialsSyncRequest):
-    """Materialien in Cloud speichern"""
+    """Materialien in Cloud speichern + Echtzeit-Broadcast an andere Geräte"""
     try:
+        synced_at = req.syncedAt or datetime.utcnow().isoformat()
+        email_norm = norm_email(req.email) if req.email else req.email
         data = {
             "deviceId": req.deviceId,
-            "email": norm_email(req.email) if req.email else req.email,
+            "email": email_norm,
             "folders": req.folders,
             "materials": req.materials,
             "tasks": req.tasks,
             "suppliers": req.suppliers,
             "loans": req.loans,
-            "syncedAt": req.syncedAt or datetime.utcnow().isoformat(),
+            "syncedAt": synced_at,
         }
-        # Upsert by email (primary) or deviceId
-        filter_q = {"email": req.email} if req.email else {"deviceId": req.deviceId}
+        filter_q = {"email": email_norm} if email_norm else {"deviceId": req.deviceId}
         await db.materials_sync.update_one(filter_q, {"$set": data}, upsert=True)
+
+        # Echtzeit-Broadcast an alle anderen Geräte mit gleicher E-Mail
+        if email_norm:
+            await broadcast_company_update(email_norm, {
+                "type": "data_updated",
+                "deviceId": req.deviceId,
+                "syncedAt": synced_at,
+            })
+
         return {"success": True, "message": f"{len(req.materials)} Materialien gespeichert"}
     except Exception as e:
         logging.error(e)
         raise HTTPException(status_code=500, detail="Sync fehlgeschlagen")
+
+
+class MaterialsPullRequest(BaseModel):
+    email: str
+    deviceId: str
+
+@api_router.post("/materials/pull")
+async def pull_materials(req: MaterialsPullRequest):
+    """Neueste Daten abrufen — kein PIN nötig (für Echtzeit-Sync)"""
+    try:
+        email_norm = norm_email(req.email)
+        sync_data = await db.materials_sync.find_one({"email": email_norm})
+        if not sync_data:
+            return {"found": False}
+        sync_data.pop("_id", None)
+        return {"found": True, **sync_data}
+    except Exception as e:
+        logging.error(e)
+        raise HTTPException(status_code=500, detail="Pull fehlgeschlagen")
 
 @api_router.post("/materials/load")
 async def load_materials(req: MaterialsLoadRequest):
