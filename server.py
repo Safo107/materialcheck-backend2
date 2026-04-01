@@ -73,7 +73,7 @@ async def send_reset_email(to_email: str, code: str) -> bool:
                 "https://api.resend.com/emails",
                 headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
                 json={
-                    "from": "MaterialCheck <noreply@elektrogenius.de>",
+                    "from": "MaterialCheck <safin.d@elektrogenius.de>",
                     "to": [to_email],
                     "subject": "MaterialCheck — PIN zurücksetzen",
                     "html": f"""
@@ -177,7 +177,7 @@ class AcceptInviteRequest(BaseModel):
 
 class RejectInviteRequest(BaseModel):
     inviteId: str
-    email: str
+    email: Optional[str] = None
 
 class ChangeRoleRequest(BaseModel):
     companyId: str
