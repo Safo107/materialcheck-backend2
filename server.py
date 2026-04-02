@@ -742,16 +742,19 @@ async def change_role(req: ChangeRoleRequest):
 
 @api_router.post("/company/{company_id}/leave")
 async def leave_company(company_id: str, email: str):
-    """Firma verlassen"""
+    """Firma verlassen — Owner verlassen = Firma wird aufgelöst (alle Mitglieder raus)"""
     try:
         company = await db.companies.find_one({"companyId": company_id})
         if not company:
             raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-        if company.get("ownerEmail") == email:
-            raise HTTPException(status_code=400, detail="Owner kann Firma nicht verlassen — Firma löschen")
+        if norm_email(company.get("ownerEmail", "")) == norm_email(email):
+            # Owner verlässt = Firma komplett auflösen
+            await db.companies.delete_one({"companyId": company_id})
+            await broadcast_company_update(company_id, {"type": "company_dissolved", "reason": "owner_left"})
+            return {"success": True, "action": "dissolved"}
         await db.companies.update_one(
             {"companyId": company_id},
-            {"$pull": {"members": {"email": email}}}
+            {"$pull": {"members": {"email": norm_email(email)}}}
         )
         await broadcast_company_update(company_id, {"type": "member_left", "email": email})
         return {"success": True}
@@ -786,60 +789,19 @@ async def remove_member(company_id: str, member_email: str, owner_email: str = "
 
 @api_router.delete("/company/{company_id}")
 async def dissolve_company(company_id: str, owner_email: str = ""):
-    """Firma auflösen: Transfer an besten Kandidaten ODER komplett löschen wenn Solo"""
+    """Firma auflösen: Immer komplett löschen — alle Mitglieder fliegen raus"""
     try:
         company = await db.companies.find_one({"companyId": company_id})
         if not company:
             raise HTTPException(status_code=404, detail="Firma nicht gefunden")
 
         # Nur Owner darf auflösen
-        owner_email_norm = norm_email(owner_email)
-        if norm_email(company.get("ownerEmail","")) != owner_email_norm:
+        if norm_email(company.get("ownerEmail","")) != norm_email(owner_email):
             raise HTTPException(status_code=403, detail="Nur der Chef kann die Firma auflösen")
 
-        members = company.get("members", [])
-        other_members = [m for m in members if norm_email(m.get("email","")) != owner_email_norm]
-
-        if not other_members:
-            # Solo-Chef → komplett löschen
-            await db.companies.delete_one({"companyId": company_id})
-            return {"success": True, "action": "deleted", "newOwner": None}
-
-        # Anderen Chef finden: Admin zuerst, dann Member — jeweils älteste joinedAt
-        def sort_key(m):
-            return m.get("joinedAt", "2099-01-01")
-
-        admins  = sorted([m for m in other_members if m.get("role") == "admin"],  key=sort_key)
-        members_only = sorted([m for m in other_members if m.get("role") not in ("owner","admin")], key=sort_key)
-
-        new_owner_member = admins[0] if admins else (members_only[0] if members_only else None)
-
-        if not new_owner_member:
-            # Keine anderen Mitglieder mehr → löschen
-            await db.companies.delete_one({"companyId": company_id})
-            return {"success": True, "action": "deleted", "newOwner": None}
-
-        new_owner_email = new_owner_member["email"]
-
-        # Neuen Owner setzen, alten Owner entfernen
-        await db.companies.update_one(
-            {"companyId": company_id},
-            {
-                "$set": {
-                    "ownerEmail": new_owner_email,
-                    "members.$[newowner].role": "owner",
-                },
-                "$pull": {"members": {"email": owner_email_norm}},
-            },
-            array_filters=[{"newowner.email": new_owner_email}]
-        )
-
-        await broadcast_company_update(company_id, {
-            "type": "ownership_transferred",
-            "newOwner": new_owner_email,
-            "previousOwner": owner_email_norm,
-        })
-        return {"success": True, "action": "transferred", "newOwner": new_owner_email}
+        await db.companies.delete_one({"companyId": company_id})
+        await broadcast_company_update(company_id, {"type": "company_dissolved", "reason": "owner_dissolved"})
+        return {"success": True, "action": "deleted"}
     except HTTPException:
         raise
     except Exception as e:
