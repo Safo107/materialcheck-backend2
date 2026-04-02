@@ -1037,6 +1037,7 @@ async def websocket_company(websocket: WebSocket, company_id: str):
 # -----------------------------
 # STRIPE
 # -----------------------------
+# Render.com: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_MATERIALCHECK_PLUS
 
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
