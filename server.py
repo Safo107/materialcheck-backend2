@@ -1062,6 +1062,32 @@ except ImportError:
     _stripe_available = False
 
 
+@api_router.get("/pro/status")
+async def get_pro_status(email: str):
+    """Pro-Status eines Users aus der DB lesen — wird nach Checkout vom Frontend aufgerufen"""
+    try:
+        profile = await db.profiles.find_one({"email": norm_email(email)})
+        if not profile:
+            return {"isPro": False, "inTrial": False, "trialEndsAt": None}
+        is_premium = profile.get("isPremium", False)
+        in_trial = profile.get("inTrial", False)
+        trial_ends_at = profile.get("trialEndsAt")
+        if isinstance(trial_ends_at, datetime):
+            trial_ends_at = trial_ends_at.isoformat()
+        # Auto-expire trial
+        if in_trial and trial_ends_at:
+            try:
+                if datetime.utcnow() > datetime.fromisoformat(trial_ends_at.replace("Z", "")):
+                    in_trial = False
+                    is_premium = False
+            except Exception:
+                pass
+        return {"isPro": is_premium, "inTrial": in_trial, "trialEndsAt": trial_ends_at}
+    except Exception as e:
+        logging.error(f"[pro/status] {e}")
+        return {"isPro": False, "inTrial": False, "trialEndsAt": None}
+
+
 class CheckoutSessionRequest(BaseModel):
     email: str
     deviceId: str
