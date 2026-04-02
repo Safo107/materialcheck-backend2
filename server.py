@@ -1083,10 +1083,38 @@ async def create_checkout_session(body: CheckoutSessionRequest):
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
         mode="subscription",
         metadata={"email": body.email, "deviceId": body.deviceId},
-        success_url="https://materialcheck.elektrogenius.de/success",
-        cancel_url="https://materialcheck.elektrogenius.de/cancel",
+        subscription_data={
+            "trial_period_days": 7,
+            "metadata": {"email": body.email, "deviceId": body.deviceId},
+        },
+        success_url="https://app.elektrogenius.de/upgrade-success?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url="https://app.elektrogenius.de",
+        locale="de",
     )
     return {"url": session.url}
+
+
+class PortalSessionRequest(BaseModel):
+    email: str
+
+
+@api_router.post("/stripe/create-portal-session")
+async def create_portal_session(body: PortalSessionRequest):
+    if not _stripe_available or not stripe_lib:
+        raise HTTPException(status_code=503, detail="Stripe nicht konfiguriert")
+    profile = await db.profiles.find_one({"email": norm_email(body.email)})
+    customer_id = profile.get("stripeCustomerId") if profile else None
+    if not customer_id:
+        raise HTTPException(status_code=404, detail="Kein Stripe-Konto gefunden. Bitte zuerst ein Abo abschließen.")
+    try:
+        portal = stripe_lib.billing_portal.Session.create(
+            customer=customer_id,
+            return_url="https://app.elektrogenius.de",
+        )
+        return {"url": portal.url}
+    except Exception as e:
+        logging.error(f"[portal] Stripe-Fehler: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @api_router.post("/stripe/webhook")
@@ -1109,14 +1137,35 @@ async def stripe_webhook(req: Request):
 
     try:
         if event["type"] == "checkout.session.completed":
-            session = event["data"]["object"]
-            email = session.get("metadata", {}).get("email")
+            # Trial startet: subscription ist jetzt "trialing"
+            session_obj = event["data"]["object"]
+            email = session_obj.get("metadata", {}).get("email")
+            sub_id = session_obj.get("subscription")
+            in_trial = False
+            trial_ends_at = None
+            if sub_id and stripe_lib:
+                try:
+                    sub = stripe_lib.Subscription.retrieve(sub_id)
+                    in_trial = sub.get("status") == "trialing"
+                    trial_end_ts = sub.get("trial_end")
+                    if trial_end_ts:
+                        trial_ends_at = datetime.utcfromtimestamp(trial_end_ts)
+                except Exception as sub_err:
+                    logging.warning(f"Subscription abruf fehlgeschlagen: {sub_err}")
             if email:
+                update_fields: dict = {
+                    "isPremium": True,
+                    "premiumSince": datetime.utcnow(),
+                    "inTrial": in_trial,
+                }
+                if trial_ends_at:
+                    update_fields["trialEndsAt"] = trial_ends_at
                 await db.profiles.update_one(
                     {"email": norm_email(email)},
-                    {"$set": {"isPremium": True, "premiumSince": datetime.utcnow()}},
+                    {"$set": update_fields},
                 )
-                logging.info(f"✅ MaterialCheck+ aktiviert für {email}")
+                status_label = "Trial gestartet" if in_trial else "aktiviert"
+                logging.info(f"✅ MaterialCheck+ {status_label} für {email}")
 
         elif event["type"] == "customer.subscription.deleted":
             subscription = event["data"]["object"]
@@ -1124,19 +1173,39 @@ async def stripe_webhook(req: Request):
             if email:
                 await db.profiles.update_one(
                     {"email": norm_email(email)},
-                    {"$set": {"isPremium": False}},
+                    {"$set": {"isPremium": False, "inTrial": False, "trialEndsAt": None}},
                 )
                 logging.info(f"❌ MaterialCheck+ deaktiviert für {email}")
 
         elif event["type"] == "customer.subscription.updated":
             subscription = event["data"]["object"]
             email = subscription.get("metadata", {}).get("email")
-            is_active = subscription.get("status") == "active"
+            status = subscription.get("status")
+            # "trialing" und "active" gelten als premium
+            is_active = status in ("active", "trialing")
+            in_trial = status == "trialing"
+            trial_end_ts = subscription.get("trial_end")
             if email:
+                update_fields = {
+                    "isPremium": is_active,
+                    "inTrial": in_trial,
+                }
+                if trial_end_ts:
+                    update_fields["trialEndsAt"] = datetime.utcfromtimestamp(trial_end_ts)
+                elif not in_trial:
+                    update_fields["trialEndsAt"] = None
                 await db.profiles.update_one(
                     {"email": norm_email(email)},
-                    {"$set": {"isPremium": is_active}},
+                    {"$set": update_fields},
                 )
+                logging.info(f"🔄 MaterialCheck+ Status={status} für {email}")
+
+        elif event["type"] == "customer.subscription.trial_will_end":
+            # 3 Tage vor Trial-Ende — optional: hier könnte eine E-Mail verschickt werden
+            subscription = event["data"]["object"]
+            email = subscription.get("metadata", {}).get("email")
+            logging.info(f"⏰ Trial endet bald für {email}")
+
     except Exception as e:
         logging.error(f"Webhook Verarbeitung Fehler: {e}")
 
