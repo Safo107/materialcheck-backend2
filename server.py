@@ -887,8 +887,8 @@ async def get_warehouse(company_id: str, warehouse_id: str, email: str = ""):
         if email:
             company = await db.companies.find_one({"companyId": company_id})
             if company:
-                member_emails = [m.get("email") for m in company.get("members", [])]
-                if email not in member_emails:
+                member_emails = [norm_email(m.get("email","")) for m in company.get("members", [])]
+                if norm_email(email) not in member_emails:
                     raise HTTPException(status_code=403, detail="Kein Zugriff")
         sync_data = await db.warehouse_materials.find_one({
             "companyId": company_id, "warehouseId": warehouse_id
@@ -910,7 +910,7 @@ async def sync_warehouse(req: WarehouseSyncRequest):
         company = await db.companies.find_one({"companyId": req.companyId})
         if not company:
             raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-        member = next((m for m in company.get("members", []) if m["email"] == req.email), None)
+        member = next((m for m in company.get("members", []) if norm_email(m.get("email","")) == norm_email(req.email)), None)
         if not member:
             raise HTTPException(status_code=403, detail="Kein Zugriff")
         data = {
@@ -1042,11 +1042,21 @@ STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_MATERIALCHECK_PLUS = os.environ.get("STRIPE_PRICE_MATERIALCHECK_PLUS", "")
 
+# Startup-Check: fehlende Stripe-Variablen loggen
+_stripe_missing = [v for v, val in {
+    "STRIPE_SECRET_KEY": STRIPE_SECRET_KEY,
+    "STRIPE_WEBHOOK_SECRET": STRIPE_WEBHOOK_SECRET,
+    "STRIPE_PRICE_MATERIALCHECK_PLUS": STRIPE_PRICE_MATERIALCHECK_PLUS,
+}.items() if not val]
+if _stripe_missing:
+    logging.warning(f"[Stripe] Fehlende Umgebungsvariablen: {', '.join(_stripe_missing)} — Checkout deaktiviert")
+
 try:
     import stripe as stripe_lib
     stripe_lib.api_key = STRIPE_SECRET_KEY if STRIPE_SECRET_KEY else None
     _stripe_available = bool(STRIPE_SECRET_KEY)
 except ImportError:
+    logging.error("[Stripe] stripe-Paket nicht installiert — pip install stripe")
     stripe_lib = None  # type: ignore
     _stripe_available = False
 
@@ -1059,7 +1069,7 @@ class CheckoutSessionRequest(BaseModel):
 @api_router.post("/stripe/create-checkout-session")
 async def create_checkout_session(body: CheckoutSessionRequest):
     if not _stripe_available or not stripe_lib:
-        raise HTTPException(status_code=503, detail="Stripe nicht konfiguriert")
+        raise HTTPException(status_code=503, detail="Stripe nicht konfiguriert. Bitte STRIPE_SECRET_KEY auf Render.com setzen.")
     if not STRIPE_PRICE_MATERIALCHECK_PLUS:
         print("[MaterialCheck+ Stripe] FEHLER: STRIPE_PRICE_MATERIALCHECK_PLUS ist nicht gesetzt. Bitte in den Umgebungsvariablen hinterlegen.")
         raise HTTPException(
@@ -1109,7 +1119,7 @@ class PortalSessionRequest(BaseModel):
 @api_router.post("/stripe/create-portal-session")
 async def create_portal_session(body: PortalSessionRequest):
     if not _stripe_available or not stripe_lib:
-        raise HTTPException(status_code=503, detail="Stripe nicht konfiguriert")
+        raise HTTPException(status_code=503, detail="Stripe nicht konfiguriert. Bitte STRIPE_SECRET_KEY auf Render.com setzen.")
     profile = await db.profiles.find_one({"email": norm_email(body.email)})
     customer_id = profile.get("stripeCustomerId") if profile else None
     if not customer_id:
@@ -1128,7 +1138,7 @@ async def create_portal_session(body: PortalSessionRequest):
 @api_router.post("/stripe/webhook")
 async def stripe_webhook(req: Request):
     if not _stripe_available or not stripe_lib:
-        raise HTTPException(status_code=503, detail="Stripe nicht konfiguriert")
+        raise HTTPException(status_code=503, detail="Stripe nicht konfiguriert. Bitte STRIPE_SECRET_KEY auf Render.com setzen.")
     if not STRIPE_WEBHOOK_SECRET:
         raise HTTPException(status_code=500, detail="STRIPE_WEBHOOK_SECRET nicht gesetzt")
 
