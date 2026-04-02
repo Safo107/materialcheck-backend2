@@ -1040,7 +1040,7 @@ async def websocket_company(websocket: WebSocket, company_id: str):
 
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "")
+STRIPE_PRICE_MATERIALCHECK_PLUS = os.environ.get("STRIPE_PRICE_MATERIALCHECK_PLUS", "")
 
 try:
     import stripe as stripe_lib
@@ -1060,8 +1060,16 @@ class CheckoutSessionRequest(BaseModel):
 async def create_checkout_session(body: CheckoutSessionRequest):
     if not _stripe_available or not stripe_lib:
         raise HTTPException(status_code=503, detail="Stripe nicht konfiguriert")
-    if not STRIPE_PRICE_ID:
-        raise HTTPException(status_code=503, detail="STRIPE_PRICE_ID fehlt")
+    if not STRIPE_PRICE_MATERIALCHECK_PLUS:
+        print("[MaterialCheck+ Stripe] FEHLER: STRIPE_PRICE_MATERIALCHECK_PLUS ist nicht gesetzt. Bitte in den Umgebungsvariablen hinterlegen.")
+        raise HTTPException(
+            status_code=400,
+            detail="Stripe-Preis-ID nicht konfiguriert. Bitte prüfe die Umgebungsvariable STRIPE_PRICE_MATERIALCHECK_PLUS.",
+        )
+
+    import os as _os
+    if _os.environ.get("ENVIRONMENT", "production") != "production":
+        print(f"[DEV] Stripe-Initiierung für MaterialCheck+ mit ID: {STRIPE_PRICE_MATERIALCHECK_PLUS} erfolgt.")
 
     profile = await db.profiles.find_one({"email": norm_email(body.email)})
     customer_id = profile.get("stripeCustomerId") if profile else None
@@ -1080,15 +1088,15 @@ async def create_checkout_session(body: CheckoutSessionRequest):
     session = stripe_lib.checkout.Session.create(
         customer=customer_id,
         payment_method_types=["card"],
-        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        line_items=[{"price": STRIPE_PRICE_MATERIALCHECK_PLUS, "quantity": 1}],
         mode="subscription",
         metadata={"email": body.email, "deviceId": body.deviceId},
         subscription_data={
             "trial_period_days": 7,
             "metadata": {"email": body.email, "deviceId": body.deviceId},
         },
-        success_url="https://app.elektrogenius.de/upgrade-success?session_id={CHECKOUT_SESSION_ID}",
-        cancel_url="https://app.elektrogenius.de",
+        success_url="https://materialcheck.elektrogenius.de/upgrade-success?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url="https://materialcheck.elektrogenius.de",
         locale="de",
     )
     return {"url": session.url}
@@ -1109,7 +1117,7 @@ async def create_portal_session(body: PortalSessionRequest):
     try:
         portal = stripe_lib.billing_portal.Session.create(
             customer=customer_id,
-            return_url="https://app.elektrogenius.de",
+            return_url="https://materialcheck.elektrogenius.de",
         )
         return {"url": portal.url}
     except Exception as e:
