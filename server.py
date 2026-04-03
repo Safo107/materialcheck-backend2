@@ -545,8 +545,31 @@ async def load_materials(req: MaterialsLoadRequest):
 
 @api_router.post("/company/create")
 async def create_company(req: CompanyCreateRequest):
-    """Firma erstellen"""
+    """Firma erstellen — nur für Pro/Trial-Nutzer"""
     try:
+        # ── PFLICHT: Pro-Status prüfen ────────────────────────────────────────
+        profile = await db.profiles.find_one({"email": norm_email(req.ownerEmail)})
+        is_premium = profile.get("isPremium", False) if profile else False
+        in_trial   = profile.get("inTrial",   False) if profile else False
+        # Trial automatisch ablaufen lassen
+        if in_trial:
+            trial_ends_at = profile.get("trialEndsAt") if profile else None
+            if trial_ends_at:
+                try:
+                    ends = trial_ends_at if isinstance(trial_ends_at, datetime) \
+                           else datetime.fromisoformat(str(trial_ends_at).replace("Z", ""))
+                    if datetime.utcnow() > ends:
+                        in_trial   = False
+                        is_premium = False
+                except Exception:
+                    pass
+        if not is_premium and not in_trial:
+            raise HTTPException(
+                status_code=403,
+                detail="MaterialCheck+ erforderlich. Bitte upgraden um eine Firma zu erstellen."
+            )
+        # ─────────────────────────────────────────────────────────────────────
+
         # Check if owner already has a company
         existing = await db.companies.find_one({"ownerEmail": req.ownerEmail})
         if existing:
@@ -1206,6 +1229,31 @@ async def stripe_webhook(req: Request):
                     {"$set": update_fields},
                 )
                 logging.info(f"🔄 MaterialCheck+ Status={status} für {email}")
+
+        elif event["type"] == "invoice.payment_succeeded":
+            # Wiederkehrende Zahlung erfolgreich → isPremium sicherstellen
+            invoice = event["data"]["object"]
+            customer_id = invoice.get("customer")
+            # Nur für Abonnement-Rechnungen (nicht Einmal-Zahlungen)
+            if customer_id and invoice.get("subscription"):
+                result = await db.profiles.update_one(
+                    {"stripeCustomerId": customer_id},
+                    {"$set": {"isPremium": True}},
+                )
+                if result.modified_count:
+                    logging.info(f"💳 Zahlung erfolgreich – isPremium=True für Stripe-Kunde {customer_id}")
+
+        elif event["type"] == "invoice.payment_failed":
+            # Zahlung fehlgeschlagen → Zugang sperren
+            invoice = event["data"]["object"]
+            customer_id = invoice.get("customer")
+            if customer_id and invoice.get("subscription"):
+                result = await db.profiles.update_one(
+                    {"stripeCustomerId": customer_id},
+                    {"$set": {"isPremium": False}},
+                )
+                if result.modified_count:
+                    logging.info(f"❌ Zahlung fehlgeschlagen – isPremium=False für Stripe-Kunde {customer_id}")
 
         elif event["type"] == "customer.subscription.trial_will_end":
             # 3 Tage vor Trial-Ende — optional: hier könnte eine E-Mail verschickt werden
