@@ -1046,6 +1046,22 @@ except ImportError:
     stripe_lib = None  # type: ignore
     _stripe_available = False
 
+# -----------------------------
+# RESEND
+# -----------------------------
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+
+try:
+    import resend as resend_lib
+    resend_lib.api_key = RESEND_API_KEY
+    _resend_available = bool(RESEND_API_KEY)
+    if not _resend_available:
+        logging.warning("[Resend] RESEND_API_KEY nicht gesetzt — E-Mail-Versand deaktiviert")
+except ImportError:
+    logging.error("[Resend] resend-Paket nicht installiert — pip install resend")
+    resend_lib = None  # type: ignore
+    _resend_available = False
+
 
 @api_router.get("/pro/status")
 async def get_pro_status(email: str):
@@ -1227,6 +1243,24 @@ async def stripe_webhook(req: Request):
                     "createdAt": datetime.utcnow(),
                 })
                 logging.info(f"📦 Bestellung {order_number} gespeichert für {email}")
+
+                # Bestätigungs-E-Mail senden
+                if _resend_available and resend_lib:
+                    try:
+                        resend_lib.Emails.send({
+                            "from": "ElektroGenius <info@elektrogenius.de>",
+                            "to": [email],
+                            "subject": f"Bestellbestätigung {order_number}",
+                            "html": f"""
+                            <h2>Danke für deine Bestellung!</h2>
+                            <p><strong>Bestellnummer:</strong> {order_number}</p>
+                            <p><strong>Produkt:</strong> {product}</p>
+                            <p>Wir melden uns in Kürze bei dir.</p>
+                            """,
+                        })
+                        logging.info(f"📧 Bestätigungs-E-Mail gesendet an {email}")
+                    except Exception as mail_err:
+                        logging.error(f"[Resend] E-Mail-Versand fehlgeschlagen: {mail_err}")
 
         elif event["type"] == "customer.subscription.deleted":
             subscription = event["data"]["object"]
