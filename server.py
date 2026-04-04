@@ -1279,7 +1279,7 @@ async def stripe_webhook(req: Request):
 
         elif event["type"] == "customer.subscription.deleted":
             subscription = event["data"]["object"]
-            email = subscription.get("metadata", {}).get("email")
+            email = (subscription.get("metadata") or {}).get("email")
             if email:
                 await db.profiles.update_one(
                     {"email": norm_email(email)},
@@ -1289,7 +1289,7 @@ async def stripe_webhook(req: Request):
 
         elif event["type"] == "customer.subscription.updated":
             subscription = event["data"]["object"]
-            email = subscription.get("metadata", {}).get("email")
+            email = (subscription.get("metadata") or {}).get("email")
             status = subscription.get("status")
             # "trialing" und "active" gelten als premium
             is_active = status in ("active", "trialing")
