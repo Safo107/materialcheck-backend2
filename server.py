@@ -1211,8 +1211,9 @@ async def stripe_webhook(req: Request):
             if sub_id and stripe_lib:
                 try:
                     sub = stripe_lib.Subscription.retrieve(sub_id)
-                    in_trial = sub.get("status") == "trialing"
-                    trial_end_ts = sub.get("trial_end")
+                    sub_status = sub.get("status") if hasattr(sub, "get") else getattr(sub, "status", None)
+                    trial_end_ts = sub.get("trial_end") if hasattr(sub, "get") else getattr(sub, "trial_end", None)
+                    in_trial = sub_status == "trialing"
                     if trial_end_ts:
                         trial_ends_at = datetime.utcfromtimestamp(trial_end_ts)
                 except Exception as sub_err:
