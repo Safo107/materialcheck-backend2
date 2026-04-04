@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Request, Query
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -6,6 +6,7 @@ from openai import AsyncOpenAI
 
 import os
 import logging
+from urllib.parse import unquote
 import hashlib
 import json
 import re
@@ -322,8 +323,8 @@ async def save_profile(profile: ProfileModel):
         data = profile.model_dump()
         if data.get("email"):
             data["email"] = norm_email(data["email"])
-        # Hash PIN if provided in plaintext (6 chars or less = plain)
-        if data.get("pin") and len(data["pin"]) <= 6:
+        # Hash PIN only when it arrives as plaintext (hasPin not yet set by client)
+        if data.get("pin") and not data.get("hasPin"):
             data["pin"] = hash_pin(data["pin"])
         # Don't overwrite existing PIN with None
         existing = None
@@ -340,7 +341,8 @@ async def save_profile(profile: ProfileModel):
             upsert=True
         )
         if data.get("email"):
-            await db.profiles.update_one({"email": data["email"]}, {"$set": data}, upsert=True)
+            # Nur sync — kein upsert, um Duplikate bei neuer Email zu vermeiden
+            await db.profiles.update_one({"email": data["email"]}, {"$set": data})
         return {"success": True}
     except Exception as e:
         logging.error(e)
@@ -383,7 +385,7 @@ async def load_profile_with_pin(req: ProfileLoadRequest):
         profile["hasPin"] = True
         profile["deviceId"] = req.deviceId  # Update device ID
         # Update device ID in DB
-        await db.profiles.update_one({"email": req.email}, {"$set": {"deviceId": req.deviceId}})
+        await db.profiles.update_one({"email": norm_email(req.email)}, {"$set": {"deviceId": req.deviceId}})
         return profile
     except HTTPException:
         raise
@@ -602,10 +604,10 @@ async def create_company(req: CompanyCreateRequest):
 async def get_company_by_owner(email: str):
     """Firma per Owner-Email laden"""
     try:
-        company = await db.companies.find_one({"ownerEmail": email})
+        company = await db.companies.find_one({"ownerEmail": norm_email(email)})
         if not company:
             # Check if member
-            company = await db.companies.find_one({"members.email": email})
+            company = await db.companies.find_one({"members.email": norm_email(email)})
         if not company:
             raise HTTPException(status_code=404, detail="Keine Firma gefunden")
         company.pop("_id", None)
@@ -620,6 +622,7 @@ async def get_company_by_owner(email: str):
 async def get_invites(email: str):
     """Ausstehende Einladungen für Email laden"""
     try:
+        email = norm_email(unquote(email))
         invites = await db.invites.find({"inviteeEmail": email, "status": "pending"}).to_list(50)
         for inv in invites:
             inv.pop("_id", None)
@@ -1064,7 +1067,7 @@ except ImportError:
 
 
 @api_router.get("/pro/status")
-async def get_pro_status(email: str):
+async def get_pro_status(email: str = Query(..., description="E-Mail des Users")):
     """Pro-Status eines Users aus der DB lesen — wird nach Checkout vom Frontend aufgerufen"""
     try:
         profile = await db.profiles.find_one({"email": norm_email(email)})
