@@ -1205,9 +1205,9 @@ async def stripe_webhook(req: Request):
             # Trial startet: subscription ist jetzt "trialing"
             session_obj = event["data"]["object"]
             email = (
-                session_obj.get("customer_details", {}).get("email")
+                (session_obj.get("customer_details") or {}).get("email")
                 or session_obj.get("customer_email")
-                or session_obj.get("metadata", {}).get("email")
+                or (session_obj.get("metadata") or {}).get("email")
             )
             if not email:
                 print("[Webhook] Keine Email gefunden – Abbruch")
