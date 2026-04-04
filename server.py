@@ -1201,6 +1201,7 @@ async def stripe_webhook(req: Request):
 
     try:
         if event["type"] == "checkout.session.completed":
+            print("[Webhook] checkout.session.completed erreicht")
             # Trial startet: subscription ist jetzt "trialing"
             session_obj = event["data"]["object"]
             email = session_obj.get("metadata", {}).get("email")
@@ -1234,6 +1235,7 @@ async def stripe_webhook(req: Request):
                 # Bestellung speichern
                 product = session_obj.get("metadata", {}).get("product", "materialcheck-plus")
                 amount = session_obj.get("amount_total", 0)
+                print(f"[Resend] Vorbereitung Email {email} | Produkt: {product} | Betrag: {amount}")
                 order_number = await generate_order_number()
                 await db.orders.insert_one({
                     "orderNumber": order_number,
@@ -1242,6 +1244,7 @@ async def stripe_webhook(req: Request):
                     "amount": amount,
                     "createdAt": datetime.utcnow(),
                 })
+                print(f"[DB] Bestellung gespeichert: {order_number}")
                 logging.info(f"📦 Bestellung {order_number} gespeichert für {email}")
 
                 # Bestätigungs-E-Mail senden
