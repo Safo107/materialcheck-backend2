@@ -1245,10 +1245,13 @@ async def stripe_webhook(req: Request):
                 logging.info(f"📦 Bestellung {order_number} gespeichert für {email}")
 
                 # Bestätigungs-E-Mail senden
-                if _resend_available and resend_lib:
+                if not _resend_available or not resend_lib:
+                    logging.warning("[Resend] Übersprungen – RESEND_API_KEY nicht gesetzt oder Paket fehlt")
+                else:
                     try:
-                        resend_lib.Emails.send({
-                            "from": "ElektroGenius <info@elektrogenius.de>",
+                        print(f"[Resend] Sende E-Mail an: {email}")
+                        response = resend_lib.Emails.send({
+                            "from": "onboarding@resend.dev",
                             "to": [email],
                             "subject": f"Bestellbestätigung {order_number}",
                             "html": f"""
@@ -1258,9 +1261,11 @@ async def stripe_webhook(req: Request):
                             <p>Wir melden uns in Kürze bei dir.</p>
                             """,
                         })
-                        logging.info(f"📧 Bestätigungs-E-Mail gesendet an {email}")
+                        print(f"[Resend] Response: {response}")
+                        logging.info(f"📧 Bestätigungs-E-Mail gesendet an {email} | ID: {getattr(response, 'id', response)}")
                     except Exception as mail_err:
-                        logging.error(f"[Resend] E-Mail-Versand fehlgeschlagen: {mail_err}")
+                        print(f"[Resend] Fehler: {mail_err}")
+                        logging.error(f"[Resend] E-Mail-Versand fehlgeschlagen für {email}: {mail_err}")
 
         elif event["type"] == "customer.subscription.deleted":
             subscription = event["data"]["object"]
