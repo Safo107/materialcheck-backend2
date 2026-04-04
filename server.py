@@ -1240,7 +1240,7 @@ async def stripe_webhook(req: Request):
             logging.info(f"✅ MaterialCheck+ {status_label} für {email}")
 
             # Bestellung speichern
-            product = session_obj.get("metadata", {}).get("product", "materialcheck-plus")
+            product = (session_obj.get("metadata") or {}).get("product", "materialcheck-plus")
             amount = session_obj.get("amount_total", 0)
             print(f"[Resend] Vorbereitung Email {email} | Produkt: {product} | Betrag: {amount}")
             order_number = await generate_order_number()
@@ -1338,7 +1338,7 @@ async def stripe_webhook(req: Request):
         elif event["type"] == "customer.subscription.trial_will_end":
             # 3 Tage vor Trial-Ende — optional: hier könnte eine E-Mail verschickt werden
             subscription = event["data"]["object"]
-            email = subscription.get("metadata", {}).get("email")
+            email = (subscription.get("metadata") or {}).get("email")
             logging.info(f"⏰ Trial endet bald für {email}")
 
     except Exception as e:
