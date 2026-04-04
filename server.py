@@ -1076,6 +1076,7 @@ async def get_pro_status(email: str):
 class CheckoutSessionRequest(BaseModel):
     email: str
     deviceId: str
+    product: str = "materialcheck-plus"
 
 
 @api_router.post("/stripe/create-checkout-session")
@@ -1112,10 +1113,10 @@ async def create_checkout_session(body: CheckoutSessionRequest):
         payment_method_types=["card"],
         line_items=[{"price": STRIPE_PRICE_MATERIALCHECK_PLUS, "quantity": 1}],
         mode="subscription",
-        metadata={"email": body.email, "deviceId": body.deviceId},
+        metadata={"email": body.email, "deviceId": body.deviceId, "product": body.product},
         subscription_data={
             "trial_period_days": 7,
-            "metadata": {"email": body.email, "deviceId": body.deviceId},
+            "metadata": {"email": body.email, "deviceId": body.deviceId, "product": body.product},
         },
         success_url="https://materialcheck.elektrogenius.de/upgrade-success?session_id={CHECKOUT_SESSION_ID}",
         cancel_url="https://materialcheck.elektrogenius.de",
@@ -1145,6 +1146,23 @@ async def create_portal_session(body: PortalSessionRequest):
     except Exception as e:
         logging.error(f"[portal] Stripe-Fehler: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def generate_order_number() -> str:
+    year = datetime.utcnow().year
+    prefix = f"EG-{year}-"
+    last = await db.orders.find_one(
+        {"orderNumber": {"$regex": f"^{prefix}"}},
+        sort=[("orderNumber", -1)],
+    )
+    if last:
+        try:
+            seq = int(last["orderNumber"].split("-")[-1]) + 1
+        except (ValueError, IndexError):
+            seq = 1
+    else:
+        seq = 1
+    return f"{prefix}{seq:04d}"
 
 
 @api_router.post("/stripe/webhook")
@@ -1196,6 +1214,19 @@ async def stripe_webhook(req: Request):
                 )
                 status_label = "Trial gestartet" if in_trial else "aktiviert"
                 logging.info(f"✅ MaterialCheck+ {status_label} für {email}")
+
+                # Bestellung speichern
+                product = session_obj.get("metadata", {}).get("product", "materialcheck-plus")
+                amount = session_obj.get("amount_total", 0)
+                order_number = await generate_order_number()
+                await db.orders.insert_one({
+                    "orderNumber": order_number,
+                    "email": norm_email(email),
+                    "product": product,
+                    "amount": amount,
+                    "createdAt": datetime.utcnow(),
+                })
+                logging.info(f"📦 Bestellung {order_number} gespeichert für {email}")
 
         elif event["type"] == "customer.subscription.deleted":
             subscription = event["data"]["object"]
