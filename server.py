@@ -1251,7 +1251,7 @@ async def stripe_webhook(req: Request):
                     try:
                         print(f"[Resend] Sende E-Mail an: {email}")
                         response = resend_lib.Emails.send({
-                            "from": "onboarding@resend.dev",
+                            "from": "ElektroGenius <info@elektrogenius.de>",
                             "to": [email],
                             "subject": f"Bestellbestätigung {order_number}",
                             "html": f"""
