@@ -1204,7 +1204,14 @@ async def stripe_webhook(req: Request):
             print("[Webhook] checkout.session.completed erreicht")
             # Trial startet: subscription ist jetzt "trialing"
             session_obj = event["data"]["object"]
-            email = session_obj.get("metadata", {}).get("email")
+            email = (
+                session_obj.get("customer_details", {}).get("email")
+                or session_obj.get("customer_email")
+                or session_obj.get("metadata", {}).get("email")
+            )
+            if not email:
+                print("[Webhook] Keine Email gefunden – Abbruch")
+                return {"received": True}
             sub_id = session_obj.get("subscription")
             in_trial = False
             trial_ends_at = None
@@ -1218,58 +1225,57 @@ async def stripe_webhook(req: Request):
                         trial_ends_at = datetime.utcfromtimestamp(trial_end_ts)
                 except Exception as sub_err:
                     logging.warning(f"Subscription abruf fehlgeschlagen: {sub_err}")
-            if email:
-                update_fields: dict = {
-                    "isPremium": True,
-                    "premiumSince": datetime.utcnow(),
-                    "inTrial": in_trial,
-                }
-                if trial_ends_at:
-                    update_fields["trialEndsAt"] = trial_ends_at
-                await db.profiles.update_one(
-                    {"email": norm_email(email)},
-                    {"$set": update_fields},
-                )
-                status_label = "Trial gestartet" if in_trial else "aktiviert"
-                logging.info(f"✅ MaterialCheck+ {status_label} für {email}")
+            update_fields: dict = {
+                "isPremium": True,
+                "premiumSince": datetime.utcnow(),
+                "inTrial": in_trial,
+            }
+            if trial_ends_at:
+                update_fields["trialEndsAt"] = trial_ends_at
+            await db.profiles.update_one(
+                {"email": norm_email(email)},
+                {"$set": update_fields},
+            )
+            status_label = "Trial gestartet" if in_trial else "aktiviert"
+            logging.info(f"✅ MaterialCheck+ {status_label} für {email}")
 
-                # Bestellung speichern
-                product = session_obj.get("metadata", {}).get("product", "materialcheck-plus")
-                amount = session_obj.get("amount_total", 0)
-                print(f"[Resend] Vorbereitung Email {email} | Produkt: {product} | Betrag: {amount}")
-                order_number = await generate_order_number()
-                await db.orders.insert_one({
-                    "orderNumber": order_number,
-                    "email": norm_email(email),
-                    "product": product,
-                    "amount": amount,
-                    "createdAt": datetime.utcnow(),
-                })
-                print(f"[DB] Bestellung gespeichert: {order_number}")
-                logging.info(f"📦 Bestellung {order_number} gespeichert für {email}")
+            # Bestellung speichern
+            product = session_obj.get("metadata", {}).get("product", "materialcheck-plus")
+            amount = session_obj.get("amount_total", 0)
+            print(f"[Resend] Vorbereitung Email {email} | Produkt: {product} | Betrag: {amount}")
+            order_number = await generate_order_number()
+            await db.orders.insert_one({
+                "orderNumber": order_number,
+                "email": norm_email(email),
+                "product": product,
+                "amount": amount,
+                "createdAt": datetime.utcnow(),
+            })
+            print(f"[DB] Bestellung gespeichert: {order_number}")
+            logging.info(f"📦 Bestellung {order_number} gespeichert für {email}")
 
-                # Bestätigungs-E-Mail senden
-                if not _resend_available or not resend_lib:
-                    logging.warning("[Resend] Übersprungen – RESEND_API_KEY nicht gesetzt oder Paket fehlt")
-                else:
-                    try:
-                        print(f"[Resend] Sende E-Mail an: {email}")
-                        response = resend_lib.Emails.send({
-                            "from": "ElektroGenius <info@elektrogenius.de>",
-                            "to": [email],
-                            "subject": f"Bestellbestätigung {order_number}",
-                            "html": f"""
-                            <h2>Danke für deine Bestellung!</h2>
-                            <p><strong>Bestellnummer:</strong> {order_number}</p>
-                            <p><strong>Produkt:</strong> {product}</p>
-                            <p>Wir melden uns in Kürze bei dir.</p>
-                            """,
-                        })
-                        print(f"[Resend] Response: {response}")
-                        logging.info(f"📧 Bestätigungs-E-Mail gesendet an {email} | ID: {getattr(response, 'id', response)}")
-                    except Exception as mail_err:
-                        print(f"[Resend] Fehler: {mail_err}")
-                        logging.error(f"[Resend] E-Mail-Versand fehlgeschlagen für {email}: {mail_err}")
+            # Bestätigungs-E-Mail senden
+            if not _resend_available or not resend_lib:
+                logging.warning("[Resend] Übersprungen – RESEND_API_KEY nicht gesetzt oder Paket fehlt")
+            else:
+                try:
+                    print(f"[Resend] Sende E-Mail an: {email}")
+                    response = resend_lib.Emails.send({
+                        "from": "ElektroGenius <info@elektrogenius.de>",
+                        "to": [email],
+                        "subject": f"Bestellbestätigung {order_number}",
+                        "html": f"""
+                        <h2>Danke für deine Bestellung!</h2>
+                        <p><strong>Bestellnummer:</strong> {order_number}</p>
+                        <p><strong>Produkt:</strong> {product}</p>
+                        <p>Wir melden uns in Kürze bei dir.</p>
+                        """,
+                    })
+                    print(f"[Resend] Response: {response}")
+                    logging.info(f"📧 Bestätigungs-E-Mail gesendet an {email} | ID: {getattr(response, 'id', response)}")
+                except Exception as mail_err:
+                    print(f"[Resend] Fehler: {mail_err}")
+                    logging.error(f"[Resend] E-Mail-Versand fehlgeschlagen für {email}: {mail_err}")
 
         elif event["type"] == "customer.subscription.deleted":
             subscription = event["data"]["object"]
