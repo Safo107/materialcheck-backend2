@@ -1114,6 +1114,11 @@ async def create_checkout_session(body: CheckoutSessionRequest):
         print(f"[DEV] Stripe-Initiierung für MaterialCheck+ mit ID: {STRIPE_PRICE_MATERIALCHECK_PLUS} erfolgt.")
 
     profile = await db.profiles.find_one({"email": norm_email(body.email)})
+
+    # Verhindere Doppel-Abo: User ist bereits Premium oder im Trial
+    if profile and (profile.get("isPremium") or profile.get("inTrial")):
+        raise HTTPException(status_code=400, detail="Du hast bereits ein aktives Abonnement für diese E-Mail-Adresse.")
+
     customer_id = profile.get("stripeCustomerId") if profile else None
 
     if not customer_id:
