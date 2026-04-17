@@ -1137,8 +1137,8 @@ async def create_checkout_session(body: CheckoutSessionRequest):
             "trial_period_days": 7,
             "metadata": {"email": body.email, "deviceId": body.deviceId, "product": body.product},
         },
-        success_url="https://materialcheck.elektrogenius.de/upgrade-success?session_id={CHECKOUT_SESSION_ID}",
-        cancel_url="https://materialcheck.elektrogenius.de",
+        success_url="https://app.elektrogenius.de/upgrade-success?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url="https://app.elektrogenius.de",
         locale="de",
     )
     return {"url": session.url}
@@ -1159,7 +1159,7 @@ async def create_portal_session(body: PortalSessionRequest):
     try:
         portal = stripe_lib.billing_portal.Session.create(
             customer=customer_id,
-            return_url="https://materialcheck.elektrogenius.de",
+            return_url="https://app.elektrogenius.de",
         )
         return {"url": portal.url}
     except Exception as e:
